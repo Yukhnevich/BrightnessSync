@@ -9,6 +9,6 @@ MinimumOSVersion: 10.0.0.0
 Installers:
 - Architecture: neutral
   InstallerUrl: https://github.com/Yukhnevich/BrightnessSync/releases/download/v1.0.0/BrightnessSync.exe
-  InstallerSha256: <SHA256 FROM THE GITHUB RELEASE>
+  InstallerSha256: 588482598EF0DDA280E38025D054D36108512A782A0DEAC80B2FF490EB06092C
 ManifestType: installer
 ManifestVersion: 1.10.0
