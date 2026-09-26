@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches AppInfo.Version
+        shell: pwsh
+        run: |
+          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $match = Select-String -Path BrightnessSync.cs -Pattern 'const string Version = "([^"]+)"'
+          $sourceVersion = $match.Matches[0].Groups[1].Value
+          if ($tagVersion -ne $sourceVersion) {
+            throw "Tag v$tagVersion does not match AppInfo.Version $sourceVersion"
+          }
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
+
+      - name: Compute SHA256
+        id: hash
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash BrightnessSync.exe -Algorithm SHA256).Hash
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BrightnessSync.exe
+          generate_release_notes: true
+          body: |
+            SHA256 (BrightnessSync.exe): `${{ steps.hash.outputs.sha256 }}`
+
+            Install: `winget install Yukhnevich.BrightnessSync`
