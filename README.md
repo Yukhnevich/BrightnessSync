@@ -3,8 +3,8 @@
 A tiny Windows tray utility that keeps your display brightness the same across all power schemes, so switching power modes no longer changes brightness.
 
 <p>
-  <img src="docs/tray-menu.png" alt="Tray menu" width="260">
-  <img src="docs/tooltip.png" alt="Tray tooltip" width="220">
+  <img src="docs/tray-menu.png" alt="Tray menu" width="447">
+  <img src="docs/tooltip.png" alt="Tray tooltip" width="447">
 </p>
 
 ## The problem
