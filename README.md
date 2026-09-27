@@ -21,7 +21,7 @@ Brightness Sync listens for brightness changes and writes the current level into
 - Tray icon with status tooltip: `Brightness Sync: on` / `Level: 50%`
 - Run at startup without UAC prompts (via Task Scheduler)
 - Hidden mode: hide the tray icon, run the app again to bring it back
-- Single instance, event-driven (no polling), ~10–15 MB RAM, no dependencies beyond .NET Framework
+- Single instance, event-driven (no polling), ~7 MB RAM idle (up to ~14 MB after using the tray menu), no dependencies beyond .NET Framework
 
 ## Requirements
 
