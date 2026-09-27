@@ -2,6 +2,11 @@
 
 A tiny Windows tray utility that keeps your display brightness the same across all power schemes, so switching power modes no longer changes brightness.
 
+<p>
+  <img src="docs/tray-menu.png" alt="Tray menu" width="260">
+  <img src="docs/tooltip.png" alt="Tray tooltip" width="220">
+</p>
+
 ## The problem
 
 Windows stores display brightness separately for every power scheme. Laptop vendor tools such as ASUS Armoury Crate switch power schemes when you change the operating mode (Silent / Performance / Turbo), and every switch restores that scheme's own brightness. The result: you set 50%, switch to Silent, and the screen jumps to 20%.
