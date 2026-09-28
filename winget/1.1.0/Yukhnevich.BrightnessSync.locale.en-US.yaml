@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
 
 PackageIdentifier: Yukhnevich.BrightnessSync
 PackageVersion: 1.1.0
@@ -36,4 +36,4 @@ ReleaseNotes: |-
   - Lower memory usage
 ReleaseNotesUrl: https://github.com/Yukhnevich/BrightnessSync/releases/tag/v1.1.0
 ManifestType: defaultLocale
-ManifestVersion: 1.10.0
+ManifestVersion: 1.12.0

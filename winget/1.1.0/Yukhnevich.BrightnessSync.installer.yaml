@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
 
 PackageIdentifier: Yukhnevich.BrightnessSync
 PackageVersion: 1.1.0
@@ -11,4 +11,4 @@ Installers:
   InstallerUrl: https://github.com/Yukhnevich/BrightnessSync/releases/download/v1.1.0/BrightnessSync.exe
   InstallerSha256: 8CE49AA7DFFF8FA9D24B48E1AC6B26261FF07F992C8B5E4A602F6E283871BE9C
 ManifestType: installer
-ManifestVersion: 1.10.0
+ManifestVersion: 1.12.0
