@@ -1,3 +1,4 @@
+* text=auto
 *.cmd text eol=crlf
 *.cs  text eol=crlf
 *.ico binary
