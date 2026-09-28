@@ -1,10 +1,12 @@
 # Brightness Sync
 
-A tiny Windows tray utility that keeps your display brightness the same across all power schemes, so switching power modes no longer changes brightness.
+A tiny Windows tray utility that keeps your display brightness the same across all power schemes, so switching power modes no longer changes it.
+
+Bonus: scroll over the tray icon to adjust the brightness.
 
 <p>
-  <img src="docs/tray-menu.png" alt="Tray menu" width="447">
-  <img src="docs/tooltip.png" alt="Tray tooltip" width="447">
+   <img src="docs/tray-menu.png" alt="Tray menu">
+   <img src="docs/scroll.gif" alt="Scrolling over the tray icon">
 </p>
 
 ## The problem
@@ -18,10 +20,12 @@ Brightness Sync listens for brightness changes and writes the current level into
 - Brightness stays put when you switch power modes
 - Picks up power schemes created later (e.g. after reinstalling Armoury Crate)
 - Restores your level if a vendor tool overwrites a scheme's brightness
-- Tray icon with status tooltip: `Brightness Sync: on` / `Level: 50%`
+- Scroll over the tray icon to change the brightness, smoothly or instantly
+- Windows 11 style tray icon that shows the brightness level and follows the light or dark taskbar
+- Tray menu and About window that follow the Windows theme
 - Run at startup without UAC prompts (via Task Scheduler)
 - Hidden mode: hide the tray icon, run the app again to bring it back
-- Single instance, event-driven (no polling), ~7 MB RAM idle (up to ~14 MB after using the tray menu), no dependencies beyond .NET Framework
+- Single instance, event-driven (no polling), ~4-8 MB RAM, no dependencies beyond .NET Framework
 
 ## Requirements
 
@@ -53,15 +57,21 @@ Download `BrightnessSync.exe` from [Releases](https://github.com/Yukhnevich/Brig
 
 That's it. From now on it starts at logon with admin rights and no UAC prompt.
 
+### Tray icon
+
+The sun's rays show the current brightness in five steps: all rays are gray below 20%, lit as dots from 20%, and grow with every next 20% until they are full at 80% and above. The ring turns gray while sync is off.
+
+Hover over the icon to see the brightness and the sync state. Scroll over it to change the brightness: one notch moves to the next level your display supports, or by 5% if it supports every percent.
+
 ### Tray menu
 
 | Item | Action |
 |---|---|
-| **Sync enabled** | Turn brightness sync on or off. The icon turns gray when off |
+| **Sync brightness** | Keep one brightness in all power schemes. Turn off to let every scheme keep its own brightness again |
 | **Run at startup** | Create or remove the scheduled task that starts the app at logon |
+| **Smooth brightness changes** | When scrolling, glide through the levels in between. Turn off to jump to the new level instantly |
 | **Hide tray icon** | Hide the icon; sync keeps running |
-| **Open log** | Open the log in Notepad |
-| **About** | Version, license and a link to this page |
+| **About** | Version, tips, the log location and a link to this page |
 | **Exit** | Quit the app |
 
 ### Launching the app again
@@ -104,14 +114,15 @@ Brightness values already written to your power schemes stay equal; this is harm
 - Listens to `WmiMonitorBrightnessEvent` (WMI) for brightness changes from the slider or Fn keys.
 - After the slider settles (1 s), writes the level into every power scheme via `PowerWriteACValueIndex` / `PowerWriteDCValueIndex`, for both AC and battery.
 - Subscribes to active power scheme changes (`GUID_ACTIVE_POWERSCHEME`). On a switch it re-syncs all schemes, ignores the brightness "echo" of the new scheme, and restores your level if it changed.
+- Windows does not send mouse wheel messages to tray icons. While the cursor is over the icon, a low-level mouse hook picks up the wheel; it is removed as soon as the cursor leaves. The brightness is set with `WmiSetBrightness`.
 - Waits on events and registry notifications, so it uses no CPU while idle.
 
 ## Files and settings
 
 | What | Where |
 |---|---|
-| Settings | `HKCU\Software\BrightnessSync` (`SyncEnabled`, `TrayVisible`) |
-| Log | `%LOCALAPPDATA%\BrightnessSync.log`, rotated to `.log.1` at 64 KB |
+| Settings | `HKCU\Software\BrightnessSync` (`SyncEnabled`, `TrayVisible`, `SmoothBrightnessChanges`, `ScrollHintSeen`) |
+| Log | `%LOCALAPPDATA%\BrightnessSync.log`, rotated to `.log.1` at 64 KB. **About → Open** opens it |
 | Startup | Task Scheduler → `BrightnessSync` |
 
 ## Troubleshooting
@@ -133,10 +144,10 @@ The source is a single file limited to C# 5, so it compiles with the built-in .N
 ## Releasing
 
 1. Bump `AppInfo.Version` in `BrightnessSync.cs`.
-2. Push a matching tag, e.g. `git tag v1.0.1 && git push origin v1.0.1`.
+2. Push a matching tag, e.g. `git tag v1.1.1 && git push origin v1.1.1`.
 3. GitHub Actions builds the exe and publishes a release with its SHA256.
 4. Update the winget manifests in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) (templates are in [`winget/`](winget)).
 
 ## License
 
-[MIT](LICENSE) © 2026 [Yukhnevich](https://github.com/Yukhnevich)
+[MIT](LICENSE) © 2026 [Pavel Yukhnevich](https://github.com/Yukhnevich)
