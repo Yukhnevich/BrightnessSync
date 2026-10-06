@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: Yukhnevich.BrightnessSync
+PackageVersion: 1.2.0
+PackageLocale: en-US
+Publisher: Yukhnevich
+PublisherUrl: https://github.com/Yukhnevich
+PublisherSupportUrl: https://github.com/Yukhnevich/BrightnessSync/issues
+Author: Pavel Yukhnevich
+PackageName: Brightness Sync
+PackageUrl: https://github.com/Yukhnevich/BrightnessSync
+License: MIT
+LicenseUrl: https://github.com/Yukhnevich/BrightnessSync/blob/main/LICENSE
+Copyright: Copyright (c) 2026 Pavel Yukhnevich
+ShortDescription: Keeps laptop brightness the same across Windows power plans and adjusts laptop and external monitors from the tray.
+Description: |-
+  Windows stores display brightness separately for every power plan, so switching power modes
+  (for example ASUS Armoury Crate Silent / Performance / Turbo) changes the brightness.
+  Brightness Sync is a small tray utility that writes the current brightness into every power plan,
+  so all modes share one brightness level.
+
+  Scroll over the tray icon to change the brightness of the laptop and external monitors (over DDC/CI).
+  All displays move together and keep the difference between them.
+Moniker: brightnesssync
+Tags:
+- brightness
+- display
+- power-plan
+- power-scheme
+- laptop
+- tray
+- armoury-crate
+- monitor
+- ddc-ci
+ReleaseNotes: |-
+  - External monitors: scrolling over the tray icon changes them too, over DDC/CI. All displays move together and keep their difference
+  - Scroll changes menu: both displays, the built-in display or the monitor; Shift or Ctrl changes only one of them for a single scroll
+  - The tray icon splits its rays between the laptop and the monitor, following the Windows display arrangement
+  - Smooth brightness changes apply to monitors as well
+  - Monitors that wake up after the laptop are picked up automatically
+ReleaseNotesUrl: https://github.com/Yukhnevich/BrightnessSync/releases/tag/v1.2.0
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
