@@ -7,10 +7,9 @@ A tiny Windows tray utility for laptop and monitor brightness:
 - **External monitors too.** One scroll adjusts the laptop and external monitors (over DDC/CI) and keeps the difference between them.
 - **Lightweight.** A single ~100 KB exe that starts instantly and uses ~5–9 MB of RAM. No installer, no background services, no Electron.
 
-<p>
-   <img src="docs/tray-menu.png" alt="Tray menu">
-   <img src="docs/scroll.gif" alt="Scrolling over the tray icon">
-</p>
+| Laptop | Laptop + external monitor |
+|:---:|:---:|
+| <img src="docs/scroll-single-display.gif" alt="Scrolling over the tray icon changes the laptop brightness" width="400"> | <img src="docs/scroll-two-displays.gif" alt="Scrolling over the tray icon changes the laptop and the external monitor" width="400"> |
 
 ## The problem
 
@@ -97,6 +96,10 @@ Changing one kind of display on its own sets the new difference. Changes made el
 When the built-in display is off (lid closed, or *Second screen only* in **Win+P**), scrolling changes only the external monitors.
 
 ### Tray menu
+
+| Laptop | Laptop + external monitor |
+|:---:|:---:|
+| <img src="docs/tray-menu-single-display.png" alt="Tray menu" width="400"> | <img src="docs/tray-menu-two-displays.png" alt="Tray menu with the Scroll changes submenu" width="400"> |
 
 | Item | Action |
 |---|---|
