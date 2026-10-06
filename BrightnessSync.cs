@@ -1,7 +1,7 @@
 // Brightness Sync - https://github.com/Yukhnevich/BrightnessSync
 // Copyright (c) 2026 Pavel Yukhnevich. MIT License, see LICENSE.
 //
-// Keeps display brightness identical across all Windows power schemes, so switching
+// Keeps display brightness identical across all Windows power plans, so switching
 // power modes (e.g. Armoury Crate Silent / Performance) no longer changes brightness.
 //
 // Build: build.cmd (uses the C# 5 compiler that ships with .NET Framework 4.5+)
@@ -10,9 +10,12 @@
 //   BrightnessSync.exe             show the tray icon and enable sync (hands over to a running instance)
 //   BrightnessSync.exe /autostart  start with saved settings (used by the "Run at startup" task)
 //
-// Scrolling over the tray icon changes the brightness.
+// Scrolling over the tray icon changes the brightness of all displays, external monitors included
+// (over DDC/CI). The tray menu narrows it to one kind of display; Shift (built-in display) and
+// Ctrl (external monitors) do the same for a single scroll.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -45,7 +48,7 @@ static class AppInfo
     public const string Id = "BrightnessSync";
     public const string DisplayName = "Brightness Sync";
     public const string Description = "Keeps display brightness the same across all Windows power schemes";
-    public const string Version = "1.1.0";
+    public const string Version = "1.2.0";
     public const string Author = "Pavel Yukhnevich";
     public const string Copyright = "Copyright \u00A9 2026 " + Author;
     public const string RepositoryUrl = "https://github.com/Yukhnevich/BrightnessSync";
@@ -102,7 +105,8 @@ static class Program
 sealed class TrayApp
 {
     readonly BrightnessKeeper keeper = new BrightnessKeeper();
-    readonly BrightnessScroller scroller = new BrightnessScroller();
+    readonly Displays displays = new Displays();
+    readonly BrightnessScroller scroller;
     readonly TrayIconImages icons = new TrayIconImages();
     SynchronizationContext uiThread;
     TrayIcon trayIcon;
@@ -110,7 +114,12 @@ sealed class TrayApp
     AboutWindow aboutWindow;
     AppSettings settings = AppSettings.Default;
     bool scrollHintSeen = SettingsStore.ScrollHintSeen;
-    int? currentBrightness; // tracked whether sync is on or off
+    int? builtInBrightness;
+
+    public TrayApp()
+    {
+        scroller = new BrightnessScroller(displays);
+    }
 
     public void Run()
     {
@@ -121,9 +130,11 @@ sealed class TrayApp
 
         keeper.StateChanged += () => OnUiThread(UpdateTrayIcon);
         scroller.Settled += ReadAndShowBrightness;
+        displays.Changed += () => OnUiThread(UpdateTrayIcon);
         SubscribeToSystemEvents();
         CreateTrayIcon();
         ThreadPool.QueueUserWorkItem(_ => Log.Guard("read brightness", ReadInitialState));
+        displays.Refresh();
 
         Apply(SettingsStore.Load());
         Log.Write(string.Format("Started (sync {0}, tray icon {1})",
@@ -148,6 +159,12 @@ sealed class TrayApp
             Log.Guard("power scheme subscription",
                 () => PowerSchemes.SubscribeToActiveSchemeChanges(keeper.HandleActiveSchemeChanged));
         });
+        SystemEvents.DisplaySettingsChanged += (s, e) => displays.RefreshSoon();
+        SystemEvents.PowerModeChanged += (s, e) =>
+        {
+            if (e.Mode == PowerModes.Resume)
+                displays.RefreshSoon(); // monitor handles do not survive sleep reliably
+        };
     }
 
     // WMI event subscriptions are more reliable when created on an MTA thread than on the STA UI thread.
@@ -164,13 +181,14 @@ sealed class TrayApp
         trayIcon.MenuRequested += anchor => Log.Guard("tray menu", () => ShowMenu(anchor));
         trayIconWheel = new TrayIconWheel(trayIcon);
         trayIconWheel.Scrolled += notches => Log.Guard("scroll", () => ScrollBrightness(notches));
+        trayIconWheel.HoverStarted += displays.ReadMonitorLevels; // catch changes made with the monitor's buttons
     }
 
     void ReadInitialState()
     {
         BrightnessSteps steps = BrightnessSteps.From(DisplayBrightness.ReadSupportedLevels());
         Log.Write("Scroll step: " + steps);
-        OnUiThread(() => scroller.Steps = steps);
+        OnUiThread(() => scroller.BuiltInSteps = steps);
         ReadAndShowBrightness();
     }
 
@@ -191,12 +209,38 @@ sealed class TrayApp
         });
     }
 
+    // Not with the lid closed or in "Second screen only", unless no external monitor is left.
+    int? ActiveBuiltInBrightness
+    {
+        get { return displays.BuiltInActive || displays.Monitors.Length == 0 ? builtInBrightness : null; }
+    }
+
     void ScrollBrightness(int notches)
     {
-        if (!currentBrightness.HasValue)
+        int? builtIn = ActiveBuiltInBrightness;
+        if (!builtIn.HasValue && displays.Monitors.Length == 0)
             return;
         HideScrollHint();
-        ShowBrightness(scroller.Scroll(currentBrightness.Value, notches, settings.SmoothBrightnessChanges));
+        int? newBuiltIn = scroller.Scroll(builtIn, notches, ScopeWithModifierKeys(settings.ScrollScope),
+            settings.SmoothBrightnessChanges);
+        if (newBuiltIn.HasValue)
+            builtInBrightness = newBuiltIn;
+        UpdateTrayIcon();
+    }
+
+    // Read straight from the keyboard: the hook runs while another app has the focus.
+    static ScrollScope ScopeWithModifierKeys(ScrollScope chosenInMenu)
+    {
+        if (KeyIsDown(NativeMethods.VK_SHIFT))
+            return ScrollScope.BuiltInOnly;
+        if (KeyIsDown(NativeMethods.VK_CONTROL))
+            return ScrollScope.ExternalOnly;
+        return chosenInMenu;
+    }
+
+    static bool KeyIsDown(int virtualKey)
+    {
+        return (NativeMethods.GetAsyncKeyState(virtualKey) & 0x8000) != 0;
     }
 
     void HideScrollHint()
@@ -209,7 +253,7 @@ sealed class TrayApp
 
     void ShowBrightness(int level)
     {
-        currentBrightness = level;
+        builtInBrightness = level;
         UpdateTrayIcon();
     }
 
@@ -222,14 +266,40 @@ sealed class TrayApp
     void UpdateTrayIcon()
     {
         bool syncActive = keeper.IsEnabled;
-        trayIcon.Update(icons.For(currentBrightness, syncActive), Tooltip(syncActive));
+        ExternalMonitor[] monitors = displays.Monitors;
+        int? builtIn = ActiveBuiltInBrightness;
+        trayIcon.Update(icons.For(IconRays(builtIn, monitors), syncActive), Tooltip(syncActive, builtIn, monitors));
     }
 
-    string Tooltip(bool syncActive)
+    int[] IconRays(int? builtIn, ExternalMonitor[] monitors)
     {
-        string text = "Sync: " + (syncActive ? "on" : "off");
-        if (currentBrightness.HasValue)
-            text = "Brightness: " + currentBrightness.Value + "%\n" + text;
+        if (monitors.Length == 0)
+            return SunRays.Uniform(builtIn);
+        if (!builtIn.HasValue)
+            return SunRays.Uniform(monitors[0].Level);
+        ExternalMonitor monitor = displays.MonitorNearestToBuiltIn(monitors);
+        return SunRays.Split(builtIn.Value, displays.BuiltInArea, monitor.Level, monitor.Area);
+    }
+
+    string Tooltip(bool syncActive, int? builtIn, ExternalMonitor[] monitors)
+    {
+        var lines = new List<string>();
+        string sync = syncActive ? "on" : "off";
+        if (monitors.Length + (builtIn.HasValue ? 1 : 0) > 1)
+        {
+            if (builtIn.HasValue)
+                lines.Add("Built-in display: " + builtIn.Value + "%");
+            foreach (ExternalMonitor monitor in monitors)
+                lines.Add(monitor.Name + ": " + monitor.Level + "%");
+            lines.Add("Power plan brightness sync: " + sync);
+        }
+        else
+        {
+            if (builtIn.HasValue || monitors.Length == 1)
+                lines.Add("Brightness: " + (builtIn.HasValue ? builtIn.Value : monitors[0].Level) + "%");
+            lines.Add("Power plan sync: " + sync);
+        }
+        string text = string.Join("\n", lines);
         if (!scrollHintSeen)
             text += "\n\nScroll to change the brightness level.";
         return text;
@@ -238,18 +308,39 @@ sealed class TrayApp
     void ShowMenu(Point anchor)
     {
         var menu = new PopupMenu();
-        menu.Add("Sync brightness", settings.SyncEnabled,
+        menu.Add("Power plan brightness sync", settings.SyncEnabled,
             () => ChangeSettings(settings.WithSyncEnabled(!settings.SyncEnabled)));
         menu.AddSeparator();
-        menu.Add("Run at startup", StartupTask.Exists(), ToggleRunAtStartup);
+        ExternalMonitor[] monitors = displays.Monitors;
+        if (monitors.Length > 0 && ActiveBuiltInBrightness.HasValue)
+            menu.AddSubmenu("Scroll changes", ScrollScopeMenu(monitors));
         menu.Add("Smooth brightness changes", settings.SmoothBrightnessChanges,
             () => ChangeSettings(settings.WithSmoothBrightnessChanges(!settings.SmoothBrightnessChanges)));
+        menu.AddSeparator();
+        menu.Add("Run at startup", StartupTask.Exists(), ToggleRunAtStartup);
         menu.Add("Hide tray icon", false, () => ChangeSettings(settings.WithTrayIconVisible(false)));
         menu.AddSeparator();
         menu.Add("About", false, ShowAbout);
-        menu.AddSeparator();
         menu.Add("Exit", false, Exit);
         menu.Show(trayIcon.WindowHandle, anchor, WindowsTheme.TaskbarIsDark);
+    }
+
+    PopupMenu ScrollScopeMenu(ExternalMonitor[] monitors)
+    {
+        string external = monitors.Length == 1 ? monitors[0].Name : "External monitors";
+        var menu = new PopupMenu();
+        AddScopeChoice(menu, monitors.Length == 1 ? "Both displays" : "All displays", ScrollScope.AllDisplays);
+        AddScopeChoice(menu, "Built-in display", ScrollScope.BuiltInOnly);
+        AddScopeChoice(menu, external, ScrollScope.ExternalOnly);
+        menu.AddSeparator();
+        menu.AddGrayedText("Shift + scroll: built-in display only");
+        menu.AddGrayedText("Ctrl + scroll: " + external + " only");
+        return menu;
+    }
+
+    void AddScopeChoice(PopupMenu menu, string text, ScrollScope scope)
+    {
+        menu.AddRadio(text, settings.ScrollScope == scope, () => ChangeSettings(settings.WithScrollScope(scope)));
     }
 
     void ChangeSettings(AppSettings newSettings)
@@ -372,7 +463,6 @@ sealed class TrayIcon : IDisposable
             Notify(NativeMethods.NIM_MODIFY, NativeMethods.NIF_ICON | NativeMethods.NIF_TIP | NativeMethods.NIF_SHOWTIP);
     }
 
-    // Screen rectangle of the icon, in the same coordinates as Cursor.Position; null when not shown.
     public Rectangle? ScreenBounds()
     {
         if (!addedToShell)
@@ -500,6 +590,7 @@ sealed class TrayIconWheel : IDisposable
     int pendingDelta;
 
     public event Action<int> Scrolled; // notches, positive = up
+    public event Action HoverStarted;
 
     public TrayIconWheel(TrayIcon icon)
     {
@@ -528,6 +619,9 @@ sealed class TrayIconWheel : IDisposable
         }
         pendingDelta = 0;
         hoverCheck.Start();
+        Action handler = HoverStarted;
+        if (handler != null)
+            handler();
     }
 
     void StopIfCursorLeft()
@@ -580,7 +674,6 @@ sealed class TrayIconWheel : IDisposable
     }
 }
 
-// Sun icons in the taskbar's colour, drawn once per step and sync state.
 sealed class TrayIconImages
 {
     static readonly Color ColorOnDarkTaskbar = Color.White;
@@ -589,22 +682,23 @@ sealed class TrayIconImages
     readonly Dictionary<string, Icon> cache = new Dictionary<string, Icon>();
     bool taskbarIsDark = WindowsTheme.TaskbarIsDark;
 
-    // Before the brightness is known the icon shows full rays.
-    public Icon For(int? brightness, bool syncActive)
+    const int MaxCachedIcons = 64; // two displays can combine their steps in many ways
+
+    public Icon For(int[] raySteps, bool syncActive)
     {
-        int step = brightness.HasValue ? SunIcon.StepFor(brightness.Value) : SunIcon.StepCount - 1;
         int size = SystemInformation.SmallIconSize.Width;
-        string key = size + "/" + step + "/" + syncActive;
+        string key = size + "/" + string.Join(",", raySteps) + "/" + syncActive;
         Icon icon;
-        if (!cache.TryGetValue(key, out icon))
-        {
-            icon = SunIcon.Create(size, step, syncActive, taskbarIsDark ? ColorOnDarkTaskbar : ColorOnLightTaskbar);
-            cache[key] = icon;
-        }
+        if (cache.TryGetValue(key, out icon))
+            return icon;
+        if (cache.Count >= MaxCachedIcons)
+            Clear();
+        icon = SunIcon.Create(size, raySteps, syncActive, taskbarIsDark ? ColorOnDarkTaskbar : ColorOnLightTaskbar);
+        cache[key] = icon;
         return icon;
     }
 
-    // Returns true when the taskbar theme changed and the icons have to be shown again.
+    // True when the icons have to be shown again
     public bool FollowTaskbarTheme()
     {
         bool dark = WindowsTheme.TaskbarIsDark;
@@ -624,6 +718,67 @@ sealed class TrayIconImages
             icon.Dispose();
         }
         cache.Clear();
+    }
+}
+
+// Which display each ray of the sun shows. Two displays split the sun the way Settings > Display
+// arranges them: side by side, each gets the rays on its side, the top ray shows the main display
+// and the bottom ray the other one; stacked, they get the upper and lower rays, and the left ray
+// shows the main display.
+static class SunRays
+{
+    const int E = 0, SE = 1, S = 2, SW = 3, W = 4, NW = 5, N = 6, NE = 7;
+
+    // Before the brightness is known the icon shows full rays.
+    public static int[] Uniform(int? percent)
+    {
+        int step = percent.HasValue ? SunIcon.StepFor(percent.Value) : SunIcon.StepCount - 1;
+        return new[] { step, step, step, step, step, step, step, step };
+    }
+
+    public static int[] Split(int builtInPercent, ScreenArea builtInArea, int monitorPercent, ScreenArea monitorArea)
+    {
+        int builtIn = SunIcon.StepFor(builtInPercent);
+        int monitor = SunIcon.StepFor(monitorPercent);
+        bool monitorIsMain = monitorArea != null && monitorArea.IsPrimary && (builtInArea == null || !builtInArea.IsPrimary);
+        int main = monitorIsMain ? monitor : builtIn;
+        int other = monitorIsMain ? builtIn : monitor;
+
+        Point offset = MonitorOffsetFromBuiltIn(builtInArea, monitorArea);
+        var rays = new int[8];
+        if (Math.Abs(offset.Y) > Math.Abs(offset.X))
+        {
+            bool monitorAbove = offset.Y < 0;
+            Assign(rays, monitorAbove ? monitor : builtIn, NW, N, NE);
+            Assign(rays, monitorAbove ? builtIn : monitor, SE, S, SW);
+            rays[W] = main;
+            rays[E] = other;
+        }
+        else
+        {
+            bool monitorOnLeft = offset.X < 0;
+            Assign(rays, monitorOnLeft ? monitor : builtIn, SW, W, NW);
+            Assign(rays, monitorOnLeft ? builtIn : monitor, NE, E, SE);
+            rays[N] = main;
+            rays[S] = other;
+        }
+        return rays;
+    }
+
+    // Unknown or identical areas (a duplicated image): the monitor counts as being on the right.
+    static Point MonitorOffsetFromBuiltIn(ScreenArea builtIn, ScreenArea monitor)
+    {
+        if (builtIn == null || monitor == null || builtIn.Bounds == monitor.Bounds)
+            return new Point(1, 0);
+        Point from = builtIn.Center;
+        Point to = monitor.Center;
+        return new Point(to.X - from.X, to.Y - from.Y);
+    }
+
+    static void Assign(int[] rays, int step, params int[] indexes)
+    {
+        foreach (int index in indexes)
+            rays[index] = step;
     }
 }
 
@@ -649,7 +804,8 @@ static class SunIcon
         return Math.Max(0, Math.Min(StepCount - 1, percent / PercentPerStep));
     }
 
-    public static Icon Create(int size, int step, bool syncActive, Color color)
+    // raySteps: one step per ray, clockwise from the right: E, SE, S, SW, W, NW, N, NE
+    public static Icon Create(int size, int[] raySteps, bool syncActive, Color color)
     {
         using (var bitmap = new Bitmap(size, size))
         {
@@ -660,7 +816,7 @@ static class SunIcon
                 float stroke = Math.Max(1f, size * StrokeRatio);
                 Color inactive = Color.FromArgb(InactiveAlpha, color);
                 DrawRing(graphics, size, stroke, syncActive ? color : inactive);
-                DrawRays(graphics, size, stroke, step, color, inactive);
+                DrawRays(graphics, size, stroke, raySteps, color, inactive);
             }
             return ToIcon(bitmap);
         }
@@ -717,12 +873,11 @@ static class SunIcon
             graphics.DrawEllipse(pen, center - radius, center - radius, 2 * radius, 2 * radius);
     }
 
-    static void DrawRays(Graphics graphics, int size, float stroke, int step, Color lit, Color unlit)
+    static void DrawRays(Graphics graphics, int size, float stroke, int[] raySteps, Color lit, Color unlit)
     {
         float center = size / 2f;
         float start = size * RayStart;
         float end = size * RayEnd;
-        float litLength = LitLength(end - start, stroke, step);
 
         using (var unlitPen = RoundPen(unlit, stroke))
         using (var litPen = RoundPen(lit, stroke))
@@ -731,6 +886,7 @@ static class SunIcon
             for (int i = 0; i < 8; i++)
             {
                 double angle = i * Math.PI / 4;
+                float litLength = LitLength(end - start, stroke, raySteps[i]);
                 PointF inner = PointOnCircle(center, start, angle);
                 graphics.DrawLine(unlitPen, inner, PointOnCircle(center, end, angle));
                 if (litLength < 0)
@@ -771,7 +927,10 @@ sealed class PopupMenu
     {
         public string Text;
         public bool Checked;
+        public bool IsRadio;
+        public bool Enabled = true;
         public Action Action;
+        public PopupMenu Submenu;
         public bool IsSeparator { get { return Text == null; } }
     }
 
@@ -780,6 +939,21 @@ sealed class PopupMenu
     public void Add(string text, bool isChecked, Action action)
     {
         items.Add(new Item { Text = text, Checked = isChecked, Action = action });
+    }
+
+    public void AddRadio(string text, bool selected, Action action)
+    {
+        items.Add(new Item { Text = text, Checked = selected, IsRadio = true, Action = action });
+    }
+
+    public void AddGrayedText(string text)
+    {
+        items.Add(new Item { Text = text, Enabled = false });
+    }
+
+    public void AddSubmenu(string text, PopupMenu submenu)
+    {
+        items.Add(new Item { Text = text, Submenu = submenu });
     }
 
     public void AddSeparator()
@@ -791,20 +965,11 @@ sealed class PopupMenu
     {
         MenuTheme.Apply(owner, dark);
 
+        var actions = new List<Action>();
         int command;
-        IntPtr menu = NativeMethods.CreatePopupMenu();
+        IntPtr menu = Build(actions);
         try
         {
-            for (int i = 0; i < items.Count; i++)
-            {
-                Item item = items[i];
-                if (item.IsSeparator)
-                    NativeMethods.AppendMenu(menu, NativeMethods.MF_SEPARATOR, UIntPtr.Zero, null);
-                else
-                    NativeMethods.AppendMenu(menu, item.Checked ? NativeMethods.MF_CHECKED : NativeMethods.MF_STRING,
-                        (UIntPtr)(uint)CommandId(i), item.Text);
-            }
-
             // Without a foreground owner the menu would not close when clicking elsewhere.
             NativeMethods.SetForegroundWindow(owner);
             command = NativeMethods.TrackPopupMenuEx(menu, TrackFlags(), location.X, location.Y, owner, IntPtr.Zero);
@@ -812,16 +977,47 @@ sealed class PopupMenu
         }
         finally
         {
-            NativeMethods.DestroyMenu(menu);
+            NativeMethods.DestroyMenu(menu); // submenus included
         }
 
         if (command > 0)
-            items[command - 1].Action();
+            actions[command - 1]();
     }
 
-    static int CommandId(int index)
+    // A command id is the action's position in actions plus one: 0 means "nothing selected".
+    IntPtr Build(List<Action> actions)
     {
-        return index + 1; // 0 means "nothing selected"
+        IntPtr menu = NativeMethods.CreatePopupMenu();
+        foreach (Item item in items)
+        {
+            if (item.IsSeparator)
+            {
+                NativeMethods.AppendMenu(menu, NativeMethods.MF_SEPARATOR, UIntPtr.Zero, null);
+                continue;
+            }
+            if (item.Submenu != null)
+            {
+                IntPtr submenu = item.Submenu.Build(actions);
+                NativeMethods.AppendMenu(menu, NativeMethods.MF_POPUP, new UIntPtr((ulong)submenu.ToInt64()), item.Text);
+                continue;
+            }
+
+            uint command = 0;
+            if (item.Action != null)
+            {
+                actions.Add(item.Action);
+                command = (uint)actions.Count;
+            }
+            uint flags = NativeMethods.MF_STRING;
+            if (!item.Enabled)
+                flags |= NativeMethods.MF_GRAYED;
+            if (item.Checked && !item.IsRadio)
+                flags |= NativeMethods.MF_CHECKED;
+            NativeMethods.AppendMenu(menu, flags, (UIntPtr)command, item.Text);
+            if (item.Checked && item.IsRadio)
+                NativeMethods.CheckMenuRadioItem(menu, command, command, command, NativeMethods.MF_BYCOMMAND);
+        }
+        return menu;
     }
 
     static uint TrackFlags()
@@ -927,6 +1123,8 @@ sealed class AboutWindow : Form
         content.Controls.Add(Header());
         content.Controls.Add(TextLabel("Tips:", palette.Text, FontStyle.Bold, 14));
         content.Controls.Add(TextLabel("\u2022 Scroll over the tray icon to change the brightness level.", palette.Text));
+        content.Controls.Add(TextLabel("\u2022 With an external monitor, choose what scrolling changes in the tray menu, " +
+            "or hold Shift (built-in display) or Ctrl (external monitors) while scrolling.", palette.Text));
         content.Controls.Add(TextLabel("\u2022 Run BrightnessSync.exe again to bring back a hidden tray icon.", palette.Text));
         content.Controls.Add(LogRow());
         content.Controls.Add(LabeledRow("Project page:", 6,
@@ -939,7 +1137,6 @@ sealed class AboutWindow : Form
         DragWindowBy(content);
     }
 
-    // Without a title bar, pressing on the background moves the window instead.
     void DragWindowBy(Control area)
     {
         area.MouseDown += (s, e) =>
@@ -1242,42 +1439,96 @@ sealed class BrightnessKeeper
     }
 }
 
-// Turns scroll notches into brightness changes. While scrolling, brightness events echo levels
-// already passed; IsScrolling tells the app to ignore them so the icon does not flicker and the
-// next notch does not start from a stale level.
+enum ScrollScope { AllDisplays, BuiltInOnly, ExternalOnly }
+
+// The built-in display alone moves by its own levels; with external monitors all displays move by
+// a small step and keep their differences (see LinkedLevels). While scrolling, brightness events
+// echo levels already passed; IsScrolling tells the app to ignore them so the icon does not flicker.
 sealed class BrightnessScroller
 {
     static readonly TimeSpan EchoWindow = TimeSpan.FromMilliseconds(700);
+    // Monitors take any level, and a bright monitor (1000+ nits) jumps visibly at 5 %.
+    const int ExternalStep = 2;
+    static readonly object BuiltInKey = new object();
 
     readonly BrightnessAnimator animator = new BrightnessAnimator();
+    readonly Displays displays;
+    readonly LinkedLevels linkedLevels;
     readonly Timer settledTimer;
     DateTime scrollingUntil;
 
     public event Action Settled; // raised on a pool thread once scrolling stops
 
-    public BrightnessScroller()
+    public BrightnessScroller(Displays displays)
     {
-        Steps = BrightnessSteps.Fine;
+        this.displays = displays;
+        BuiltInSteps = BrightnessSteps.Fine;
+        linkedLevels = new LinkedLevels(SnapToSupportedLevel);
         settledTimer = new Timer(_ => Log.Guard("after scroll", OnSettled));
     }
 
-    public BrightnessSteps Steps { get; set; }
+    public BrightnessSteps BuiltInSteps { get; set; }
 
     public bool IsScrolling
     {
         get { return DateTime.UtcNow < scrollingUntil; }
     }
 
-    // Returns the level the display is heading to.
-    public int Scroll(int from, int notches, bool smooth)
+    // Takes the built-in display's level (null without one) and returns the level it is heading to.
+    public int? Scroll(int? builtIn, int notches, ScrollScope scope, bool smooth)
     {
         scrollingUntil = DateTime.UtcNow + EchoWindow;
         settledTimer.Change(EchoWindow, Timeout.InfiniteTimeSpan);
 
-        int target = Steps.Move(from, notches);
-        if (target != from)
-            animator.AnimateTo(from, target, Steps, smooth);
-        return target;
+        ExternalMonitor[] monitors = displays.Monitors;
+        if (monitors.Length == 0 && builtIn.HasValue)
+            return MoveBuiltIn(builtIn.Value, BuiltInSteps.Move(builtIn.Value, notches), smooth);
+
+        var levels = new Dictionary<object, int>();
+        if (builtIn.HasValue)
+            levels[BuiltInKey] = builtIn.Value;
+        foreach (ExternalMonitor monitor in monitors)
+            levels[monitor] = monitor.Level;
+        linkedLevels.Follow(levels);
+
+        Func<object, bool> inScope = DisplaysIn(scope, levels.Keys);
+        int step = BuiltInSteps.TypicalStep;
+        foreach (object display in levels.Keys)
+            if (display != BuiltInKey && inScope(display))
+                step = ExternalStep;
+
+        int? newBuiltIn = builtIn;
+        foreach (KeyValuePair<object, int> change in linkedLevels.Move(notches * step, inScope))
+        {
+            if (change.Key == BuiltInKey)
+                newBuiltIn = MoveBuiltIn(builtIn.Value, change.Value, smooth);
+            else
+                displays.SetMonitorLevel((ExternalMonitor)change.Key, change.Value, smooth);
+        }
+        return newBuiltIn;
+    }
+
+    // A scope with no display connected falls back to all displays.
+    static Func<object, bool> DisplaysIn(ScrollScope scope, IEnumerable<object> connected)
+    {
+        Func<object, bool> inScope = display =>
+            scope == ScrollScope.AllDisplays || (display == BuiltInKey) == (scope == ScrollScope.BuiltInOnly);
+        foreach (object display in connected)
+            if (inScope(display))
+                return inScope;
+        return display => true;
+    }
+
+    int MoveBuiltIn(int from, int to, bool smooth)
+    {
+        if (to != from)
+            animator.AnimateTo(from, to, BuiltInSteps, smooth);
+        return to;
+    }
+
+    int SnapToSupportedLevel(object display, int level)
+    {
+        return display == BuiltInKey ? BuiltInSteps.Nearest(level) : level;
     }
 
     // Scrolling makes dozens of WMI calls; release their COM objects right away instead of
@@ -1291,6 +1542,92 @@ sealed class BrightnessScroller
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+    }
+}
+
+// Levels of displays that scroll together. Each display keeps an offset from a shared level, and
+// the shared level may run past 0 and 100: a display that hit a limit waits there while the others
+// move on, and on the way back the others catch up first, so the displays get their old
+// difference back (30 % and 60 % stay 30 % and 60 % after a trip to 0 % or 100 %).
+sealed class LinkedLevels
+{
+    readonly Func<object, int, int> snapToSupportedLevel;
+    readonly Dictionary<object, int> offsets = new Dictionary<object, int>();
+    readonly Dictionary<object, int> lastSet = new Dictionary<object, int>();
+    int shared;
+
+    public LinkedLevels(Func<object, int, int> snapToSupportedLevel)
+    {
+        this.snapToSupportedLevel = snapToSupportedLevel;
+    }
+
+    // Takes in the displays' actual levels. A display that is new, or was changed by something
+    // else (Fn keys, the Windows slider, the monitor's buttons), gets the offset of where it is now.
+    public void Follow(IDictionary<object, int> actualLevels)
+    {
+        foreach (object display in new List<object>(offsets.Keys))
+        {
+            if (actualLevels.ContainsKey(display))
+                continue;
+            offsets.Remove(display);
+            lastSet.Remove(display);
+        }
+        foreach (KeyValuePair<object, int> display in actualLevels)
+        {
+            if (offsets.Count == 0)
+                shared = display.Value;
+            int level;
+            if (lastSet.TryGetValue(display.Key, out level) && level == display.Value)
+                continue;
+            offsets[display.Key] = display.Value - shared;
+            lastSet[display.Key] = display.Value;
+        }
+    }
+
+    // Moving only some displays changes their offsets, so the new difference is kept from then on.
+    // Returns the displays whose level changed, with their new levels.
+    public Dictionary<object, int> Move(int delta, Func<object, bool> inScope)
+    {
+        var moving = new List<object>();
+        foreach (object display in offsets.Keys)
+            if (inScope(display))
+                moving.Add(display);
+
+        if (moving.Count == offsets.Count)
+            shared = ClampToUsefulRange(ClampToUsefulRange(shared) + delta);
+        else
+            foreach (object display in moving)
+                offsets[display] = Clamp(lastSet[display] + delta) - shared;
+
+        var changes = new Dictionary<object, int>();
+        foreach (object display in moving)
+        {
+            int level = snapToSupportedLevel(display, Clamp(shared + offsets[display]));
+            if (level == lastSet[display])
+                continue;
+            lastSet[display] = level;
+            changes[display] = level;
+        }
+        return changes;
+    }
+
+    // Beyond the point where every display is at 0 (or 100) further notches would only have to be
+    // scrolled back before anything happens.
+    int ClampToUsefulRange(int level)
+    {
+        int lowestOffset = int.MaxValue;
+        int highestOffset = int.MinValue;
+        foreach (int offset in offsets.Values)
+        {
+            lowestOffset = Math.Min(lowestOffset, offset);
+            highestOffset = Math.Max(highestOffset, offset);
+        }
+        return Math.Max(-highestOffset, Math.Min(100 - lowestOffset, level));
+    }
+
+    static int Clamp(int level)
+    {
+        return Math.Max(0, Math.Min(100, level));
     }
 }
 
@@ -1323,6 +1660,28 @@ sealed class BrightnessSteps
     public bool IsDiscrete
     {
         get { return levels != null; }
+    }
+
+    public int TypicalStep
+    {
+        get
+        {
+            if (levels == null)
+                return FineStep;
+            double average = (levels[levels.Length - 1] - levels[0]) / (double)(levels.Length - 1);
+            return Math.Max(1, (int)Math.Round(average));
+        }
+    }
+
+    public int Nearest(int level)
+    {
+        if (levels == null)
+            return level;
+        int nearest = levels[0];
+        foreach (int candidate in levels)
+            if (Math.Abs(candidate - level) < Math.Abs(nearest - level))
+                nearest = candidate;
+        return nearest;
     }
 
     public int Move(int level, int notches)
@@ -1557,6 +1916,599 @@ static class DisplayBrightness
                     onChanged(Convert.ToInt32(change["Brightness"]));
             });
         changeWatcher.Start();
+    }
+}
+
+// The displays in use: external monitors controlled over DDC/CI, and whether and where the
+// built-in display shows. Monitor calls run on one background thread: they are slow (tens of
+// milliseconds each) and monitors do not handle overlapping commands.
+sealed class Displays
+{
+    // DDC/CI asks for a pause of about 50 ms after each command.
+    static readonly TimeSpan MinWriteInterval = TimeSpan.FromMilliseconds(60);
+    // A newly connected or woken monitor needs a moment before it answers DDC/CI, and after sleep
+    // it may wake well after the laptop without Windows reporting a display change.
+    static readonly TimeSpan DisplayChangeSettleDelay = TimeSpan.FromSeconds(2);
+    static readonly TimeSpan[] RetryDelaysForSilentMonitors =
+    {
+        TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)
+    };
+    static readonly TimeSpan MinReadInterval = TimeSpan.FromSeconds(2);
+    const int EasingDivisor = 3;
+
+    readonly BlockingCollection<Action> work = new BlockingCollection<Action>();
+    readonly Timer refreshTimer;
+    readonly object gate = new object();
+    readonly Dictionary<ExternalMonitor, int> targetLevels = new Dictionary<ExternalMonitor, int>();
+    bool smoothWrites;
+    bool writeScheduled;
+    volatile ExternalMonitor[] monitors = new ExternalMonitor[0];
+    volatile bool builtInActive = true;
+    volatile ScreenArea builtInArea;
+    volatile bool displaysChanged;
+    // Worker thread only
+    string loggedDisplays;
+    DateTime lastRead;
+    int retriesDone;
+    bool allMonitorsSilent; // external screens are on, but none answers DDC/CI
+
+    public event Action Changed; // displays or their levels changed; raised on the worker thread
+
+    public Displays()
+    {
+        var worker = new Thread(() =>
+        {
+            foreach (Action action in work.GetConsumingEnumerable())
+                action();
+        });
+        worker.IsBackground = true;
+        worker.Start();
+        refreshTimer = new Timer(_ => Refresh());
+    }
+
+    // Only monitors that report their brightness
+    public ExternalMonitor[] Monitors
+    {
+        get { return monitors; }
+    }
+
+    // False with the lid closed or in "Second screen only"
+    public bool BuiltInActive
+    {
+        get { return builtInActive; }
+    }
+
+    // Null when unknown
+    public ScreenArea BuiltInArea
+    {
+        get { return builtInArea; }
+    }
+
+    public ExternalMonitor MonitorNearestToBuiltIn(ExternalMonitor[] candidates)
+    {
+        ScreenArea builtIn = builtInArea;
+        ExternalMonitor nearest = candidates[0];
+        if (builtIn == null)
+            return nearest;
+        foreach (ExternalMonitor candidate in candidates)
+        {
+            if (candidate.Area == null)
+                continue;
+            if (nearest.Area == null || builtIn.DistanceTo(candidate.Area) < builtIn.DistanceTo(nearest.Area))
+                nearest = candidate;
+        }
+        return nearest;
+    }
+
+    public void Refresh()
+    {
+        Post("find displays", FindDisplays);
+    }
+
+    public void RefreshSoon()
+    {
+        displaysChanged = true;
+        refreshTimer.Change(DisplayChangeSettleDelay, Timeout.InfiniteTimeSpan);
+    }
+
+    public void ReadMonitorLevels()
+    {
+        Post("read external brightness", ReadMonitorLevelsNow);
+    }
+
+    // Level shows the new level right away. The monitor gets there within MinWriteInterval, or,
+    // when smooth, glides there in steps that cover a third of the remaining distance.
+    public void SetMonitorLevel(ExternalMonitor monitor, int percent, bool smooth)
+    {
+        monitor.MarkRequested(percent);
+        lock (gate)
+        {
+            targetLevels[monitor] = percent;
+            smoothWrites = smooth;
+            if (writeScheduled)
+                return;
+            writeScheduled = true;
+        }
+        Post("set external brightness", WriteUntilTargetsReached);
+    }
+
+    void Post(string operation, Action action)
+    {
+        work.Add(() => Log.Guard(operation, action));
+    }
+
+    void FindDisplays()
+    {
+        Dictionary<string, DisplayDevice> devices = DisplayDevice.Active();
+        ExternalMonitor[] previous = monitors;
+        ScreenArea builtIn;
+        monitors = ExternalMonitor.FindAll(devices, out builtIn).ToArray();
+        builtInArea = builtIn;
+        builtInActive = devices.Count == 0 || ShowsOnBuiltIn(devices); // unknown: assume it is in use
+        lock (gate)
+            targetLevels.Clear();
+        foreach (ExternalMonitor monitor in previous)
+            monitor.Dispose();
+        lastRead = DateTime.UtcNow;
+        RetryIfMonitorsAreSilent(ExternalScreenCount(devices));
+
+        var names = new List<string> { builtInActive ? "built-in" : "built-in off" };
+        foreach (ExternalMonitor monitor in monitors)
+            names.Add(monitor.EdidVendor == null ? monitor.Name : monitor.Name + " [" + monitor.EdidVendor + "]");
+        string description = string.Join(", ", names);
+        if (monitors.Length == 0)
+            description += " (no external monitor with DDC/CI brightness)";
+        if (description != loggedDisplays)
+            Log.Write("Displays: " + description);
+        loggedDisplays = description;
+        RaiseChanged();
+    }
+
+    void RetryIfMonitorsAreSilent(int externalScreens)
+    {
+        if (displaysChanged)
+        {
+            displaysChanged = false;
+            retriesDone = 0;
+        }
+        allMonitorsSilent = externalScreens > 0 && monitors.Length == 0;
+        if (monitors.Length >= externalScreens)
+            retriesDone = 0;
+        else if (retriesDone < RetryDelaysForSilentMonitors.Length)
+            refreshTimer.Change(RetryDelaysForSilentMonitors[retriesDone++], Timeout.InfiniteTimeSpan);
+    }
+
+    static int ExternalScreenCount(Dictionary<string, DisplayDevice> devices)
+    {
+        int count = 0;
+        foreach (DisplayDevice device in devices.Values)
+            count += device.ExternalScreens.Count;
+        return count;
+    }
+
+    static bool ShowsOnBuiltIn(Dictionary<string, DisplayDevice> devices)
+    {
+        foreach (DisplayDevice device in devices.Values)
+            if (device.ShowsOnBuiltIn)
+                return true;
+        return false;
+    }
+
+    // Hovering over the icon also gives a monitor that was silent so far another chance.
+    void ReadMonitorLevelsNow()
+    {
+        if (DateTime.UtcNow - lastRead < MinReadInterval)
+            return;
+        if (allMonitorsSilent)
+        {
+            FindDisplays();
+            return;
+        }
+        lastRead = DateTime.UtcNow;
+        bool changed = false;
+        foreach (ExternalMonitor monitor in monitors)
+        {
+            int before = monitor.Level;
+            monitor.Read();
+            changed |= monitor.Level != before;
+        }
+        if (changed)
+            RaiseChanged();
+    }
+
+    void WriteUntilTargetsReached()
+    {
+        try
+        {
+            while (WriteNextStep())
+                Thread.Sleep(MinWriteInterval);
+        }
+        catch
+        {
+            lock (gate)
+                writeScheduled = false;
+            throw;
+        }
+    }
+
+    bool WriteNextStep()
+    {
+        List<KeyValuePair<ExternalMonitor, int>> targets;
+        bool smooth;
+        lock (gate)
+        {
+            if (targetLevels.Count == 0)
+            {
+                writeScheduled = false;
+                return false;
+            }
+            targets = new List<KeyValuePair<ExternalMonitor, int>>(targetLevels);
+            smooth = smoothWrites;
+        }
+
+        ExternalMonitor[] current = monitors;
+        foreach (KeyValuePair<ExternalMonitor, int> target in targets)
+        {
+            ExternalMonitor monitor = target.Key;
+            bool reached = true;
+            if (Array.IndexOf(current, monitor) >= 0) // a monitor replaced by a refresh is skipped
+            {
+                int next = smooth ? NextStep(monitor.Applied, target.Value) : target.Value;
+                if (monitor.Write(next))
+                {
+                    reached = next == target.Value;
+                }
+                else
+                {
+                    Log.Write("Cannot set the brightness of " + monitor.Name + ": error " + Marshal.GetLastWin32Error());
+                    RefreshSoon();
+                }
+            }
+            if (!reached)
+                continue;
+            lock (gate)
+            {
+                int latest;
+                if (targetLevels.TryGetValue(monitor, out latest) && latest == target.Value)
+                    targetLevels.Remove(monitor);
+            }
+        }
+        return true;
+    }
+
+    static int NextStep(int from, int to)
+    {
+        int distance = to - from;
+        return from + Math.Sign(distance) * Math.Max(1, Math.Abs(distance) / EasingDivisor);
+    }
+
+    void RaiseChanged()
+    {
+        Action handler = Changed;
+        if (handler != null)
+            handler();
+    }
+}
+
+// A monitor whose brightness is set over DDC/CI (VCP code 0x10, "luminance"). Used only on the
+// Displays worker thread, except for the properties and MarkRequested.
+sealed class ExternalMonitor : IDisposable
+{
+    const byte LuminanceCode = 0x10;
+    const int Attempts = 3; // DDC/CI drops a command now and then, especially through docks and hubs
+    static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
+
+    readonly uint maximum;
+    IntPtr handle;
+    uint lastWrittenValue = uint.MaxValue;
+    int applied;      // what the monitor is at, as far as we know
+    int requestCount;
+    volatile int level; // where it is heading: shown in the tooltip
+
+    ExternalMonitor(IntPtr handle, string name, string edidVendor, ScreenArea area, uint current, uint maximum)
+    {
+        this.handle = handle;
+        this.maximum = maximum;
+        Name = name;
+        EdidVendor = edidVendor;
+        Area = area;
+        level = applied = ToPercent(current);
+    }
+
+    public string Name { get; private set; }
+
+    public ScreenArea Area { get; private set; }
+
+    // Three-letter vendor code from the monitor's EDID (DEL, GSM ...), null when unknown
+    public string EdidVendor { get; private set; }
+
+    public int Level
+    {
+        get { return level; }
+    }
+
+    public int Applied
+    {
+        get { return applied; }
+    }
+
+    // The built-in panel answers DDC/CI rarely, and is skipped anyway: WMI controls it. With a
+    // duplicated image one display device has several physical monitors; the external ones get
+    // the external names in order.
+    public static List<ExternalMonitor> FindAll(Dictionary<string, DisplayDevice> devices, out ScreenArea builtInArea)
+    {
+        var found = new List<ExternalMonitor>();
+        builtInArea = null;
+        foreach (IntPtr displayMonitor in DisplayMonitors())
+        {
+            var info = new NativeMethods.MonitorInfoEx { cbSize = Marshal.SizeOf(typeof(NativeMethods.MonitorInfoEx)) };
+            if (!NativeMethods.GetMonitorInfo(displayMonitor, ref info))
+                continue;
+            var area = new ScreenArea(info);
+            DisplayDevice device;
+            devices.TryGetValue(info.szDevice, out device);
+            if (device != null && device.ShowsOnBuiltIn)
+                builtInArea = area;
+            if (device != null && device.ExternalScreens.Count == 0)
+                continue;
+            int nameIndex = 0;
+            foreach (NativeMethods.PhysicalMonitor physical in PhysicalMonitors(displayMonitor))
+            {
+                uint current, maximum;
+                if (!TryReadLuminance(physical.handle, out current, out maximum) || maximum == 0)
+                {
+                    NativeMethods.DestroyPhysicalMonitor(physical.handle);
+                    continue;
+                }
+                DisplayDevice.Screen screen = device != null && nameIndex < device.ExternalScreens.Count
+                    ? device.ExternalScreens[nameIndex++]
+                    : new DisplayDevice.Screen();
+                string name = UniqueName(screen.Name ?? NameOf(physical), found);
+                found.Add(new ExternalMonitor(physical.handle, name, screen.EdidVendor, area, current, maximum));
+            }
+        }
+        return found;
+    }
+
+    // Called when a new level is requested, so that a read already under way does not overwrite it.
+    public void MarkRequested(int percent)
+    {
+        Interlocked.Increment(ref requestCount);
+        level = percent;
+    }
+
+    public bool Write(int percent)
+    {
+        uint value = (uint)Math.Round(percent * maximum / 100.0);
+        for (int attempt = 1; handle != IntPtr.Zero && attempt <= Attempts; attempt++)
+        {
+            if (NativeMethods.SetVCPFeature(handle, LuminanceCode, value))
+            {
+                lastWrittenValue = value;
+                applied = percent;
+                return true;
+            }
+            Thread.Sleep(RetryDelay);
+        }
+        return false;
+    }
+
+    public void Read()
+    {
+        int requestsBefore = Thread.VolatileRead(ref requestCount);
+        uint current, ignoredMaximum;
+        if (!TryReadLuminance(handle, out current, out ignoredMaximum))
+            return;
+        if (current != lastWrittenValue) // the same value would come back rounded differently
+            applied = ToPercent(current);
+        if (Thread.VolatileRead(ref requestCount) == requestsBefore)
+            level = applied;
+    }
+
+    public void Dispose()
+    {
+        if (handle != IntPtr.Zero)
+            NativeMethods.DestroyPhysicalMonitor(handle);
+        handle = IntPtr.Zero;
+    }
+
+    int ToPercent(uint value)
+    {
+        return (int)Math.Round(Math.Min(value, maximum) * 100.0 / maximum);
+    }
+
+    static bool TryReadLuminance(IntPtr monitor, out uint current, out uint maximum)
+    {
+        current = maximum = 0;
+        for (int attempt = 1; monitor != IntPtr.Zero && attempt <= Attempts; attempt++)
+        {
+            if (NativeMethods.GetVCPFeatureAndVCPFeatureReply(monitor, LuminanceCode, IntPtr.Zero, out current, out maximum))
+                return true;
+            Thread.Sleep(RetryDelay);
+        }
+        return false;
+    }
+
+    static List<IntPtr> DisplayMonitors()
+    {
+        var found = new List<IntPtr>();
+        NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (monitor, dc, bounds, data) =>
+        {
+            found.Add(monitor);
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    static NativeMethods.PhysicalMonitor[] PhysicalMonitors(IntPtr displayMonitor)
+    {
+        uint count;
+        if (!NativeMethods.GetNumberOfPhysicalMonitorsFromHMONITOR(displayMonitor, out count) || count == 0)
+            return new NativeMethods.PhysicalMonitor[0];
+        var physical = new NativeMethods.PhysicalMonitor[count];
+        return NativeMethods.GetPhysicalMonitorsFromHMONITOR(displayMonitor, count, physical)
+            ? physical
+            : new NativeMethods.PhysicalMonitor[0];
+    }
+
+    static string NameOf(NativeMethods.PhysicalMonitor physical)
+    {
+        string description = (physical.description ?? "").Trim();
+        return description.Length == 0 || description.StartsWith("Generic", StringComparison.OrdinalIgnoreCase)
+            ? "External monitor"
+            : description;
+    }
+
+    static string UniqueName(string name, List<ExternalMonitor> others)
+    {
+        string unique = name;
+        for (int number = 2; others.Exists(other => other.Name == unique); number++)
+            unique = name + " " + number;
+        return unique;
+    }
+}
+
+sealed class ScreenArea
+{
+    public ScreenArea(NativeMethods.MonitorInfoEx info)
+    {
+        Bounds = Rectangle.FromLTRB(info.rcMonitor.Left, info.rcMonitor.Top, info.rcMonitor.Right, info.rcMonitor.Bottom);
+        IsPrimary = (info.dwFlags & NativeMethods.MONITORINFOF_PRIMARY) != 0;
+    }
+
+    public Rectangle Bounds { get; private set; }
+    public bool IsPrimary { get; private set; } // the main display
+
+    public Point Center
+    {
+        get { return new Point(Bounds.Left + Bounds.Width / 2, Bounds.Top + Bounds.Height / 2); }
+    }
+
+    public double DistanceTo(ScreenArea other)
+    {
+        Point a = Center;
+        Point b = other.Center;
+        return Math.Sqrt((double)(a.X - b.X) * (a.X - b.X) + (double)(a.Y - b.Y) * (a.Y - b.Y));
+    }
+}
+
+// The screens Windows shows a display device (\\.\DISPLAY1 ...) on: one, or several when the
+// image is duplicated. External screens get their own model name, as in Settings > Display,
+// with the vendor in front when the model name leaves it out.
+sealed class DisplayDevice
+{
+    public sealed class Screen
+    {
+        public string Name;
+        public string EdidVendor;
+    }
+
+    // EDID carries only a registered three-letter code; these are well-known monitor brands.
+    static readonly Dictionary<string, string> Vendors = new Dictionary<string, string>
+    {
+        { "ACI", "ASUS" }, { "ACR", "Acer" }, { "AOC", "AOC" }, { "APP", "Apple" }, { "AUS", "ASUS" },
+        { "BNQ", "BenQ" }, { "DEL", "Dell" }, { "EIZ", "EIZO" }, { "GBT", "Gigabyte" }, { "GSM", "LG" },
+        { "HPN", "HP" }, { "HWP", "HP" }, { "IVM", "iiyama" }, { "LEN", "Lenovo" }, { "MSI", "MSI" },
+        { "NEC", "NEC" }, { "PHL", "Philips" }, { "SAM", "Samsung" }, { "SHP", "Sharp" }, { "SKG", "KTC" },
+        { "SNY", "Sony" }, { "VSC", "ViewSonic" }
+    };
+
+    public bool ShowsOnBuiltIn;
+    public readonly List<Screen> ExternalScreens = new List<Screen>();
+
+    // Empty when Windows cannot tell
+    public static Dictionary<string, DisplayDevice> Active()
+    {
+        var devices = new Dictionary<string, DisplayDevice>(StringComparer.OrdinalIgnoreCase);
+        uint pathCount, modeCount;
+        if (NativeMethods.GetDisplayConfigBufferSizes(NativeMethods.QDC_ONLY_ACTIVE_PATHS, out pathCount, out modeCount) != 0)
+            return devices;
+        var paths = new NativeMethods.DisplayConfigPathInfo[pathCount];
+        var modes = new NativeMethods.DisplayConfigModeInfo[modeCount];
+        if (NativeMethods.QueryDisplayConfig(NativeMethods.QDC_ONLY_ACTIVE_PATHS,
+                ref pathCount, paths, ref modeCount, modes, IntPtr.Zero) != 0)
+            return devices;
+
+        for (int i = 0; i < pathCount; i++)
+        {
+            var source = new NativeMethods.DisplayConfigSourceDeviceName();
+            source.header = Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, source,
+                paths[i].sourceInfo.adapterId, paths[i].sourceInfo.id);
+            if (NativeMethods.DisplayConfigGetDeviceInfo(ref source) != 0)
+                continue;
+            DisplayDevice device;
+            if (!devices.TryGetValue(source.viewGdiDeviceName, out device))
+                devices[source.viewGdiDeviceName] = device = new DisplayDevice();
+
+            if (IsBuiltInConnection(paths[i].targetInfo.outputTechnology))
+            {
+                device.ShowsOnBuiltIn = true;
+                continue;
+            }
+            var target = new NativeMethods.DisplayConfigTargetDeviceName();
+            target.header = Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, target,
+                paths[i].targetInfo.adapterId, paths[i].targetInfo.id);
+            var screen = new Screen();
+            if (NativeMethods.DisplayConfigGetDeviceInfo(ref target) == 0)
+            {
+                if ((target.flags & NativeMethods.DISPLAYCONFIG_TARGET_EDID_IDS_VALID) != 0)
+                    screen.EdidVendor = VendorCode(target.edidManufactureId);
+                screen.Name = WithVendor(target.monitorFriendlyDeviceName, screen.EdidVendor);
+            }
+            device.ExternalScreens.Add(screen);
+        }
+        return devices;
+    }
+
+    // EDID packs three letters into five bits each (1 = A), big-endian. Windows hands the two
+    // bytes over as they are, so they normally come out swapped.
+    static string VendorCode(ushort edidId)
+    {
+        return Letters(((edidId & 0xFF) << 8) | (edidId >> 8)) ?? Letters(edidId);
+    }
+
+    static string Letters(int packed)
+    {
+        var code = new char[3];
+        for (int i = 0; i < 3; i++)
+        {
+            int letter = (packed >> (10 - 5 * i)) & 0x1F;
+            if (letter < 1 || letter > 26)
+                return null;
+            code[i] = (char)('A' + letter - 1);
+        }
+        return new string(code);
+    }
+
+    static string WithVendor(string model, string vendorCode)
+    {
+        if (string.IsNullOrEmpty(model))
+            return null;
+        string vendor;
+        if (vendorCode == null || !Vendors.TryGetValue(vendorCode, out vendor)
+            || model.StartsWith(vendor, StringComparison.OrdinalIgnoreCase))
+            return model;
+        return vendor + " " + model;
+    }
+
+    static NativeMethods.DisplayConfigDeviceInfoHeader Header(uint type, object request, NativeMethods.Luid adapter, uint id)
+    {
+        return new NativeMethods.DisplayConfigDeviceInfoHeader
+        {
+            type = type,
+            size = (uint)Marshal.SizeOf(request),
+            adapterId = adapter,
+            id = id
+        };
+    }
+
+    static bool IsBuiltInConnection(uint outputTechnology)
+    {
+        return outputTechnology == NativeMethods.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+            || outputTechnology == NativeMethods.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS
+            || outputTechnology == NativeMethods.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED
+            || outputTechnology == NativeMethods.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED;
     }
 }
 
@@ -1846,38 +2798,45 @@ static class WindowsBuild
 
 sealed class AppSettings
 {
-    public static readonly AppSettings Default = new AppSettings(true, true, true);
+    public static readonly AppSettings Default = new AppSettings(true, true, true, ScrollScope.AllDisplays);
 
-    public AppSettings(bool syncEnabled, bool trayIconVisible, bool smoothBrightnessChanges)
+    public AppSettings(bool syncEnabled, bool trayIconVisible, bool smoothBrightnessChanges, ScrollScope scrollScope)
     {
         SyncEnabled = syncEnabled;
         TrayIconVisible = trayIconVisible;
         SmoothBrightnessChanges = smoothBrightnessChanges;
+        ScrollScope = scrollScope;
     }
 
     public bool SyncEnabled { get; private set; }
     public bool TrayIconVisible { get; private set; }
     public bool SmoothBrightnessChanges { get; private set; }
+    public ScrollScope ScrollScope { get; private set; }
 
     public AppSettings WithSyncEnabled(bool value)
     {
-        return new AppSettings(value, TrayIconVisible, SmoothBrightnessChanges);
+        return new AppSettings(value, TrayIconVisible, SmoothBrightnessChanges, ScrollScope);
     }
 
     public AppSettings WithTrayIconVisible(bool value)
     {
-        return new AppSettings(SyncEnabled, value, SmoothBrightnessChanges);
+        return new AppSettings(SyncEnabled, value, SmoothBrightnessChanges, ScrollScope);
     }
 
     public AppSettings WithSmoothBrightnessChanges(bool value)
     {
-        return new AppSettings(SyncEnabled, TrayIconVisible, value);
+        return new AppSettings(SyncEnabled, TrayIconVisible, value, ScrollScope);
+    }
+
+    public AppSettings WithScrollScope(ScrollScope value)
+    {
+        return new AppSettings(SyncEnabled, TrayIconVisible, SmoothBrightnessChanges, value);
     }
 
     // A manual launch shows the icon and enables sync, but keeps the user's other preferences.
     public AppSettings ForManualLaunch()
     {
-        return new AppSettings(true, true, SmoothBrightnessChanges);
+        return new AppSettings(true, true, SmoothBrightnessChanges, ScrollScope);
     }
 }
 
@@ -1887,6 +2846,7 @@ static class SettingsStore
     const string SyncEnabledValue = "SyncEnabled";
     const string TrayIconVisibleValue = "TrayVisible";
     const string SmoothBrightnessChangesValue = "SmoothBrightnessChanges";
+    const string ScrollScopeValue = "ScrollScope";
     const string ScrollHintSeenValue = "ScrollHintSeen";
 
     public static AppSettings Load()
@@ -1896,7 +2856,8 @@ static class SettingsStore
             return new AppSettings(
                 ReadFlag(key, SyncEnabledValue),
                 ReadFlag(key, TrayIconVisibleValue),
-                ReadFlag(key, SmoothBrightnessChangesValue));
+                ReadFlag(key, SmoothBrightnessChangesValue),
+                ReadScrollScope(key));
         }
     }
 
@@ -1907,6 +2868,7 @@ static class SettingsStore
             WriteFlag(key, SyncEnabledValue, settings.SyncEnabled);
             WriteFlag(key, TrayIconVisibleValue, settings.TrayIconVisible);
             WriteFlag(key, SmoothBrightnessChangesValue, settings.SmoothBrightnessChanges);
+            key.SetValue(ScrollScopeValue, (int)settings.ScrollScope, RegistryValueKind.DWord);
         }
     }
 
@@ -1934,6 +2896,12 @@ static class SettingsStore
     static RegistryKey OpenKey()
     {
         return Registry.CurrentUser.CreateSubKey(KeyPath);
+    }
+
+    static ScrollScope ReadScrollScope(RegistryKey key)
+    {
+        var scope = (ScrollScope)Convert.ToInt32(key.GetValue(ScrollScopeValue, 0));
+        return Enum.IsDefined(typeof(ScrollScope), scope) ? scope : ScrollScope.AllDisplays;
     }
 
     static bool ReadFlag(RegistryKey key, string name)
@@ -2197,9 +3165,163 @@ static class NativeMethods
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr GetModuleHandle(string moduleName);
 
+    // --- keyboard
+
+    public const int VK_SHIFT = 0x10, VK_CONTROL = 0x11;
+
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int virtualKey);
+
+    // --- monitors: enumeration, display configuration and DDC/CI (dxva2)
+
+    public const uint QDC_ONLY_ACTIVE_PATHS = 2;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
+    public const uint DISPLAYCONFIG_TARGET_EDID_IDS_VALID = 4;
+    public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS = 6;
+    public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED = 11;
+    public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED = 13;
+    public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL = 0x80000000;
+
+    public const uint MONITORINFOF_PRIMARY = 1;
+
+    public delegate bool MonitorEnumProc(IntPtr monitor, IntPtr dc, IntPtr bounds, IntPtr data);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MonitorInfoEx
+    {
+        public int cbSize;
+        public Rect rcMonitor;
+        public Rect rcWork;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 1)]
+    public struct PhysicalMonitor
+    {
+        public IntPtr handle;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string description;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigPathSourceInfo
+    {
+        public Luid adapterId;
+        public uint id;
+        public uint modeInfoIdx;
+        public uint statusFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigPathTargetInfo
+    {
+        public Luid adapterId;
+        public uint id;
+        public uint modeInfoIdx;
+        public uint outputTechnology;
+        public uint rotation;
+        public uint scaling;
+        public uint refreshRateNumerator;
+        public uint refreshRateDenominator;
+        public uint scanLineOrdering;
+        public int targetAvailable;
+        public uint statusFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigPathInfo
+    {
+        public DisplayConfigPathSourceInfo sourceInfo;
+        public DisplayConfigPathTargetInfo targetInfo;
+        public uint flags;
+    }
+
+    // Only needed as a buffer: 16 bytes of header and a 48-byte union of mode details
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigModeInfo
+    {
+        public uint infoType;
+        public uint id;
+        public Luid adapterId;
+        public ulong mode0, mode1, mode2, mode3, mode4, mode5;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigDeviceInfoHeader
+    {
+        public uint type;
+        public uint size;
+        public Luid adapterId;
+        public uint id;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DisplayConfigSourceDeviceName
+    {
+        public DisplayConfigDeviceInfoHeader header;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DisplayConfigTargetDeviceName
+    {
+        public DisplayConfigDeviceInfoHeader header;
+        public uint flags;
+        public uint outputTechnology;
+        public ushort edidManufactureId;
+        public ushort edidProductCodeId;
+        public uint connectorInstance;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfoEx info);
+
+    [DllImport("user32.dll")]
+    public static extern int GetDisplayConfigBufferSizes(uint flags, out uint pathCount, out uint modeCount);
+
+    [DllImport("user32.dll")]
+    public static extern int QueryDisplayConfig(uint flags, ref uint pathCount, [Out] DisplayConfigPathInfo[] paths,
+        ref uint modeCount, [Out] DisplayConfigModeInfo[] modes, IntPtr currentTopology);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigSourceDeviceName request);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigTargetDeviceName request);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    public static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr monitor, out uint count);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    public static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr monitor, uint count, [Out] PhysicalMonitor[] monitors);
+
+    [DllImport("dxva2.dll")]
+    public static extern bool DestroyPhysicalMonitor(IntPtr monitor);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    public static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr monitor, byte code, IntPtr codeType,
+        out uint currentValue, out uint maximumValue);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    public static extern bool SetVCPFeature(IntPtr monitor, byte code, uint value);
+
     // --- popup menu
 
-    public const uint MF_STRING = 0x0000, MF_CHECKED = 0x0008, MF_SEPARATOR = 0x0800;
+    public const uint MF_STRING = 0x0000, MF_BYCOMMAND = 0x0000, MF_GRAYED = 0x0001, MF_CHECKED = 0x0008,
+        MF_POPUP = 0x0010, MF_SEPARATOR = 0x0800;
     public const uint TPM_LEFTALIGN = 0x0000, TPM_RIGHTBUTTON = 0x0002, TPM_RIGHTALIGN = 0x0008,
         TPM_BOTTOMALIGN = 0x0020, TPM_NONOTIFY = 0x0080, TPM_RETURNCMD = 0x0100;
     public const int SM_MENUDROPALIGNMENT = 40;
@@ -2212,6 +3334,9 @@ static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern int TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr owner, IntPtr parameters);
+
+    [DllImport("user32.dll")]
+    public static extern bool CheckMenuRadioItem(IntPtr menu, uint first, uint last, uint check, uint flags);
 
     [DllImport("user32.dll")]
     public static extern bool DestroyMenu(IntPtr menu);
