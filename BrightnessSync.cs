@@ -1,7 +1,7 @@
 // Brightness Sync - https://github.com/Yukhnevich/BrightnessSync
 // Copyright (c) 2026 Pavel Yukhnevich. MIT License, see LICENSE.
 //
-// Keeps display brightness identical across all Windows power schemes, so switching
+// Keeps display brightness identical across all Windows power plans, so switching
 // power modes (e.g. Armoury Crate Silent / Performance) no longer changes brightness.
 //
 // Build: build.cmd (uses the C# 5 compiler that ships with .NET Framework 4.5+)
@@ -114,7 +114,7 @@ sealed class TrayApp
     AboutWindow aboutWindow;
     AppSettings settings = AppSettings.Default;
     bool scrollHintSeen = SettingsStore.ScrollHintSeen;
-    int? builtInBrightness; // tracked whether sync is on or off
+    int? builtInBrightness;
 
     public TrayApp()
     {
@@ -333,8 +333,8 @@ sealed class TrayApp
         AddScopeChoice(menu, "Built-in display", ScrollScope.BuiltInOnly);
         AddScopeChoice(menu, external, ScrollScope.ExternalOnly);
         menu.AddSeparator();
-        menu.AddNote("Shift + scroll: built-in display only");
-        menu.AddNote("Ctrl + scroll: " + external + " only");
+        menu.AddGrayedText("Shift + scroll: built-in display only");
+        menu.AddGrayedText("Ctrl + scroll: " + external + " only");
         return menu;
     }
 
@@ -463,7 +463,6 @@ sealed class TrayIcon : IDisposable
             Notify(NativeMethods.NIM_MODIFY, NativeMethods.NIF_ICON | NativeMethods.NIF_TIP | NativeMethods.NIF_SHOWTIP);
     }
 
-    // Screen rectangle of the icon, in the same coordinates as Cursor.Position; null when not shown.
     public Rectangle? ScreenBounds()
     {
         if (!addedToShell)
@@ -675,7 +674,6 @@ sealed class TrayIconWheel : IDisposable
     }
 }
 
-// Sun icons in the taskbar's colour, drawn once per step and sync state.
 sealed class TrayIconImages
 {
     static readonly Color ColorOnDarkTaskbar = Color.White;
@@ -700,7 +698,7 @@ sealed class TrayIconImages
         return icon;
     }
 
-    // Returns true when the taskbar theme changed and the icons have to be shown again.
+    // True when the icons have to be shown again
     public bool FollowTaskbarTheme()
     {
         bool dark = WindowsTheme.TaskbarIsDark;
@@ -948,8 +946,7 @@ sealed class PopupMenu
         items.Add(new Item { Text = text, Checked = selected, IsRadio = true, Action = action });
     }
 
-    // A grayed-out line of text
-    public void AddNote(string text)
+    public void AddGrayedText(string text)
     {
         items.Add(new Item { Text = text, Enabled = false });
     }
@@ -1140,7 +1137,6 @@ sealed class AboutWindow : Form
         DragWindowBy(content);
     }
 
-    // Without a title bar, pressing on the background moves the window instead.
     void DragWindowBy(Control area)
     {
         area.MouseDown += (s, e) =>
@@ -1445,10 +1441,9 @@ sealed class BrightnessKeeper
 
 enum ScrollScope { AllDisplays, BuiltInOnly, ExternalOnly }
 
-// Turns scroll notches into brightness changes. The built-in display alone moves by its own
-// levels; with external monitors all displays move by a small step and keep their differences
-// (see LinkedLevels). While scrolling, brightness events echo levels already passed; IsScrolling
-// tells the app to ignore them so the icon does not flicker.
+// The built-in display alone moves by its own levels; with external monitors all displays move by
+// a small step and keep their differences (see LinkedLevels). While scrolling, brightness events
+// echo levels already passed; IsScrolling tells the app to ignore them so the icon does not flicker.
 sealed class BrightnessScroller
 {
     static readonly TimeSpan EchoWindow = TimeSpan.FromMilliseconds(700);
@@ -1931,8 +1926,14 @@ sealed class Displays
 {
     // DDC/CI asks for a pause of about 50 ms after each command.
     static readonly TimeSpan MinWriteInterval = TimeSpan.FromMilliseconds(60);
-    // A newly connected or woken monitor needs a moment before it answers DDC/CI.
+    // A newly connected or woken monitor needs a moment before it answers DDC/CI, and after sleep
+    // it may wake well after the laptop without Windows reporting a display change.
     static readonly TimeSpan DisplayChangeSettleDelay = TimeSpan.FromSeconds(2);
+    static readonly TimeSpan[] RetryDelaysForSilentMonitors =
+    {
+        TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)
+    };
     static readonly TimeSpan MinReadInterval = TimeSpan.FromSeconds(2);
     const int EasingDivisor = 3;
 
@@ -1945,8 +1946,12 @@ sealed class Displays
     volatile ExternalMonitor[] monitors = new ExternalMonitor[0];
     volatile bool builtInActive = true;
     volatile ScreenArea builtInArea;
-    string loggedDisplays; // worker thread only
-    DateTime lastRead;     // worker thread only
+    volatile bool displaysChanged;
+    // Worker thread only
+    string loggedDisplays;
+    DateTime lastRead;
+    int retriesDone;
+    bool allMonitorsSilent; // external screens are on, but none answers DDC/CI
 
     public event Action Changed; // displays or their levels changed; raised on the worker thread
 
@@ -2003,6 +2008,7 @@ sealed class Displays
 
     public void RefreshSoon()
     {
+        displaysChanged = true;
         refreshTimer.Change(DisplayChangeSettleDelay, Timeout.InfiniteTimeSpan);
     }
 
@@ -2045,6 +2051,7 @@ sealed class Displays
         foreach (ExternalMonitor monitor in previous)
             monitor.Dispose();
         lastRead = DateTime.UtcNow;
+        RetryIfMonitorsAreSilent(ExternalScreenCount(devices));
 
         var names = new List<string> { builtInActive ? "built-in" : "built-in off" };
         foreach (ExternalMonitor monitor in monitors)
@@ -2058,6 +2065,28 @@ sealed class Displays
         RaiseChanged();
     }
 
+    void RetryIfMonitorsAreSilent(int externalScreens)
+    {
+        if (displaysChanged)
+        {
+            displaysChanged = false;
+            retriesDone = 0;
+        }
+        allMonitorsSilent = externalScreens > 0 && monitors.Length == 0;
+        if (monitors.Length >= externalScreens)
+            retriesDone = 0;
+        else if (retriesDone < RetryDelaysForSilentMonitors.Length)
+            refreshTimer.Change(RetryDelaysForSilentMonitors[retriesDone++], Timeout.InfiniteTimeSpan);
+    }
+
+    static int ExternalScreenCount(Dictionary<string, DisplayDevice> devices)
+    {
+        int count = 0;
+        foreach (DisplayDevice device in devices.Values)
+            count += device.ExternalScreens.Count;
+        return count;
+    }
+
     static bool ShowsOnBuiltIn(Dictionary<string, DisplayDevice> devices)
     {
         foreach (DisplayDevice device in devices.Values)
@@ -2066,10 +2095,16 @@ sealed class Displays
         return false;
     }
 
+    // Hovering over the icon also gives a monitor that was silent so far another chance.
     void ReadMonitorLevelsNow()
     {
         if (DateTime.UtcNow - lastRead < MinReadInterval)
             return;
+        if (allMonitorsSilent)
+        {
+            FindDisplays();
+            return;
+        }
         lastRead = DateTime.UtcNow;
         bool changed = false;
         foreach (ExternalMonitor monitor in monitors)
@@ -2334,7 +2369,6 @@ sealed class ExternalMonitor : IDisposable
     }
 }
 
-// Where a display sits on the desktop, as arranged in Settings > Display
 sealed class ScreenArea
 {
     public ScreenArea(NativeMethods.MonitorInfoEx info)
@@ -2777,7 +2811,7 @@ sealed class AppSettings
     public bool SyncEnabled { get; private set; }
     public bool TrayIconVisible { get; private set; }
     public bool SmoothBrightnessChanges { get; private set; }
-    public ScrollScope ScrollScope { get; private set; } // what scrolling changes with external monitors
+    public ScrollScope ScrollScope { get; private set; }
 
     public AppSettings WithSyncEnabled(bool value)
     {
