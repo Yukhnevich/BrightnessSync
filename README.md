@@ -1,8 +1,11 @@
 # Brightness Sync
 
-A tiny Windows tray utility that keeps your display brightness the same across all power plans, so switching power modes no longer changes it.
+A tiny Windows tray utility for laptop and monitor brightness:
 
-Bonus: scroll over the tray icon to adjust the brightness.
+- **Same brightness in every power plan.** Switching power modes (e.g. Armoury Crate Silent / Turbo) no longer changes your brightness.
+- **Scroll over the tray icon** to change the brightness, smoothly or instantly.
+- **External monitors too.** One scroll adjusts the laptop and external monitors (over DDC/CI) and keeps the difference between them.
+- **Lightweight.** A single ~100 KB exe that starts instantly and uses ~5–9 MB of RAM. No installer, no background services, no Electron.
 
 <p>
    <img src="docs/tray-menu.png" alt="Tray menu">
@@ -26,19 +29,21 @@ Brightness Sync listens for brightness changes and writes the current level into
 - Tray menu and About window that follow the Windows theme
 - Run at startup without UAC prompts (via Task Scheduler)
 - Hidden mode: hide the tray icon, run the app again to bring it back
-- Single instance, event-driven (no polling), ~4-8 MB RAM, no dependencies beyond .NET Framework
+- Single instance, event-driven (no polling), ~100 KB exe, 5–9 MB RAM, no dependencies beyond .NET Framework
 
 ## Requirements
 
 - Windows 10 or 11
 - .NET Framework 4.5 or newer (preinstalled on Windows 10/11)
-- A laptop with a built-in display. Brightness sync across power plans works only for built-in panels: Windows keeps per-plan brightness only for them
-- Optional: external monitors with DDC/CI enabled (usually a setting in the monitor's own menu) for scroll control
+- Power plan sync: a laptop with a built-in display. Windows keeps a separate brightness per power plan only for built-in panels, so external monitors don't need it
+- External monitors: DDC/CI support, usually a setting in the monitor's own menu. Scrolling works for them on desktop PCs too
 - Administrator rights (power plans can only be modified by an admin)
 
 ## Install
 
 ### winget
+
+> The winget package is under review. Until it appears, use the [manual install](#manual).
 
 ```
 winget install Yukhnevich.BrightnessSync
@@ -157,7 +162,7 @@ Brightness values already written to your power plans stay equal; this is harmle
 
 ## Troubleshooting
 
-- **Nothing happens / icon stays gray.** Open the log. `Cannot read display brightness via WMI` means the display doesn't support WMI brightness (e.g. a desktop with an external monitor).
+- **Nothing happens / icon stays gray.** Open the log. `Cannot read display brightness via WMI` means there is no built-in display with WMI brightness (e.g. a desktop PC): power plan sync is not available, but external monitors can still be adjusted by scrolling.
 - **An external monitor is not in the tooltip.** Enable *DDC/CI* in the monitor's own menu. The log lists the displays found (`Displays: built-in, KTC M27P6`). Some docks and adapters do not pass DDC/CI through.
 - **Brightness still changes in one mode.** Check the log for `Cannot write power scheme` errors; the app must run elevated.
 - **Screen dims without the slider moving.** That is not a per-plan brightness issue but panel/driver power saving: disable *Content adaptive brightness* in Windows display settings, *Display Power Savings* in Intel Graphics Software, or *Vari-Bright* in AMD Software.
