@@ -11,8 +11,8 @@
 //   BrightnessSync.exe /autostart  start with saved settings (used by the "Run at startup" task)
 //
 // Scrolling over the tray icon changes the brightness of all displays, external monitors included
-// (over DDC/CI). The tray menu narrows it to one kind of display; Shift (built-in display) and
-// Ctrl (external monitors) do the same for a single scroll.
+// (over DDC/CI, or SDR content brightness in HDR). The tray menu narrows it to one kind of display;
+// Shift (built-in display) and Ctrl (external monitors) do the same for a single scroll.
 
 using System;
 using System.Collections.Concurrent;
@@ -48,7 +48,7 @@ static class AppInfo
     public const string Id = "BrightnessSync";
     public const string DisplayName = "Brightness Sync";
     public const string Description = "Keeps display brightness the same across all Windows power schemes";
-    public const string Version = "1.2.0";
+    public const string Version = "1.3.0";
     public const string Author = "Pavel Yukhnevich";
     public const string Copyright = "Copyright \u00A9 2026 " + Author;
     public const string RepositoryUrl = "https://github.com/Yukhnevich/BrightnessSync";
@@ -159,7 +159,11 @@ sealed class TrayApp
             Log.Guard("power scheme subscription",
                 () => PowerSchemes.SubscribeToActiveSchemeChanges(keeper.HandleActiveSchemeChanged));
         });
-        SystemEvents.DisplaySettingsChanged += (s, e) => displays.RefreshSoon();
+        SystemEvents.DisplaySettingsChanged += (s, e) =>
+        {
+            displays.RefreshSoon();
+            ThreadPool.QueueUserWorkItem(_ => Log.Guard("display change", keeper.HandleDisplaysChanged));
+        };
         SystemEvents.PowerModeChanged += (s, e) =>
         {
             if (e.Mode == PowerModes.Resume)
@@ -288,21 +292,28 @@ sealed class TrayApp
         if (monitors.Length + (builtIn.HasValue ? 1 : 0) > 1)
         {
             if (builtIn.HasValue)
-                lines.Add("Built-in display: " + builtIn.Value + "%");
+                lines.Add("Built-in display" + HdrMark(displays.BuiltInHdr) + ": " + builtIn.Value + "%");
             foreach (ExternalMonitor monitor in monitors)
-                lines.Add(monitor.Name + ": " + monitor.Level + "%");
+                lines.Add(monitor.Name + HdrMark(monitor.Hdr) + ": " + monitor.Level + "%");
             lines.Add("Power plan brightness sync: " + sync);
         }
         else
         {
-            if (builtIn.HasValue || monitors.Length == 1)
-                lines.Add("Brightness: " + (builtIn.HasValue ? builtIn.Value : monitors[0].Level) + "%");
+            if (builtIn.HasValue)
+                lines.Add("Brightness" + HdrMark(displays.BuiltInHdr) + ": " + builtIn.Value + "%");
+            else if (monitors.Length == 1)
+                lines.Add("Brightness" + HdrMark(monitors[0].Hdr) + ": " + monitors[0].Level + "%");
             lines.Add("Power plan sync: " + sync);
         }
         string text = string.Join("\n", lines);
         if (!scrollHintSeen)
             text += "\n\nScroll to change the brightness level.";
         return text;
+    }
+
+    static string HdrMark(bool hdr)
+    {
+        return hdr ? " (HDR)" : "";
     }
 
     void ShowMenu(Point anchor)
@@ -1310,7 +1321,8 @@ sealed class BrightnessKeeper
     readonly Timer settleTimer;
     readonly Timer restoreTimer;
     bool enabled;
-    int keptLevel = -1;
+    int keptLevel = -1; // for the current HDR state
+    bool hdr;
     int? pendingLevel;
     DateTime pendingSince;
     DateTime ignoreChangesUntil;
@@ -1346,10 +1358,13 @@ sealed class BrightnessKeeper
                 return;
             }
             keptLevel = current.Value;
+            hdr = DisplayDevice.BuiltInHdrIsOn();
+            if (!hdr)
+                SettingsStore.BrightnessOutsideHdr = null;
             PowerSchemes.SetBrightnessInAll(keptLevel);
             enabled = true;
         }
-        Log.Write("Sync enabled at " + KeptLevel + "%");
+        Log.Write("Sync enabled at " + KeptLevel + "%" + (hdr ? " (HDR)" : ""));
         RaiseStateChanged();
     }
 
@@ -1399,19 +1414,72 @@ sealed class BrightnessKeeper
         }
     }
 
+    public void HandleDisplaysChanged()
+    {
+        lock (gate)
+        {
+            if (enabled)
+                FollowHdrState();
+        }
+    }
+
     void SavePendingLevel()
     {
         lock (gate)
         {
+            if (!enabled || FollowHdrState())
+                return;
             int? level = pendingLevel;
             pendingLevel = null;
-            if (!enabled || level == null || level == keptLevel)
+            if (level == null || level == keptLevel)
                 return;
             keptLevel = level.Value;
             PowerSchemes.SetBrightnessInAll(keptLevel);
         }
         Log.Write("Brightness " + KeptLevel + "% saved to all power schemes");
         RaiseStateChanged();
+    }
+
+    // Windows sets the built-in display to 80 % when HDR turns on, often before it reports the
+    // display change, so this also runs before a pending level is saved. That level stays: the
+    // backlight lights HDR content too, and changing it back would flash. The usual level is stored
+    // and comes back when HDR turns off, which Windows does not do by itself.
+    // Returns true when the HDR state changed.
+    bool FollowHdrState()
+    {
+        bool hdrNow = DisplayDevice.BuiltInHdrIsOn();
+        if (hdrNow == hdr)
+            return false;
+        hdr = hdrNow;
+        settleTimer.Change(Never, Never);
+        int? pending = pendingLevel;
+        pendingLevel = null;
+
+        if (hdr)
+        {
+            int usualLevel = keptLevel;
+            SettingsStore.BrightnessOutsideHdr = usualLevel;
+            int? windowsLevel = pending ?? DisplayBrightness.Read();
+            if (windowsLevel.HasValue)
+                keptLevel = windowsLevel.Value;
+            Log.Write("HDR on: brightness " + keptLevel + "%, " + usualLevel + "% comes back when HDR turns off");
+        }
+        else
+        {
+            int? usualLevel = SettingsStore.BrightnessOutsideHdr;
+            SettingsStore.BrightnessOutsideHdr = null;
+            if (usualLevel.HasValue)
+            {
+                keptLevel = usualLevel.Value;
+                ignoreChangesUntil = DateTime.UtcNow + SchemeSwitchEchoWindow;
+                DisplayBrightness.Set(keptLevel);
+                restoreTimer.Change(RestoreCheckDelay, Never);
+            }
+            Log.Write("HDR off: brightness " + keptLevel + "%");
+        }
+        PowerSchemes.SetBrightnessInAll(keptLevel);
+        RaiseStateChanged();
+        return true;
     }
 
     void RestoreKeptLevelIfChanged()
@@ -1428,7 +1496,7 @@ sealed class BrightnessKeeper
                 return;
             DisplayBrightness.Set(kept);
         }
-        Log.Write("Brightness restored after scheme switch: " + current + "% -> " + kept + "%");
+        Log.Write("Brightness restored: " + current + "% -> " + kept + "%");
     }
 
     void RaiseStateChanged()
@@ -1946,8 +2014,10 @@ sealed class Displays
     volatile ExternalMonitor[] monitors = new ExternalMonitor[0];
     volatile bool builtInActive = true;
     volatile ScreenArea builtInArea;
+    volatile bool builtInHdr;
     volatile bool displaysChanged;
     // Worker thread only
+    DisplayDevice.Screen builtInScreen;
     string loggedDisplays;
     DateTime lastRead;
     int retriesDone;
@@ -1983,6 +2053,12 @@ sealed class Displays
     public ScreenArea BuiltInArea
     {
         get { return builtInArea; }
+    }
+
+    // For the tooltip only: in HDR the built-in display keeps its backlight control
+    public bool BuiltInHdr
+    {
+        get { return builtInHdr; }
     }
 
     public ExternalMonitor MonitorNearestToBuiltIn(ExternalMonitor[] candidates)
@@ -2046,6 +2122,8 @@ sealed class Displays
         monitors = ExternalMonitor.FindAll(devices, out builtIn).ToArray();
         builtInArea = builtIn;
         builtInActive = devices.Count == 0 || ShowsOnBuiltIn(devices); // unknown: assume it is in use
+        builtInScreen = DisplayDevice.BuiltInScreenOf(devices);
+        builtInHdr = builtInScreen != null && SdrContentBrightness.HdrIsOn(builtInScreen);
         lock (gate)
             targetLevels.Clear();
         foreach (ExternalMonitor monitor in previous)
@@ -2053,12 +2131,13 @@ sealed class Displays
         lastRead = DateTime.UtcNow;
         RetryIfMonitorsAreSilent(ExternalScreenCount(devices));
 
-        var names = new List<string> { builtInActive ? "built-in" : "built-in off" };
+        var names = new List<string> { (builtInActive ? "built-in" : "built-in off") + (builtInHdr ? " (HDR)" : "") };
         foreach (ExternalMonitor monitor in monitors)
-            names.Add(monitor.EdidVendor == null ? monitor.Name : monitor.Name + " [" + monitor.EdidVendor + "]");
+            names.Add(monitor.Name + (monitor.EdidVendor == null ? "" : " [" + monitor.EdidVendor + "]")
+                + (monitor.Hdr ? " (HDR)" : ""));
         string description = string.Join(", ", names);
         if (monitors.Length == 0)
-            description += " (no external monitor with DDC/CI brightness)";
+            description += " (no external monitor with DDC/CI brightness or HDR)";
         if (description != loggedDisplays)
             Log.Write("Displays: " + description);
         loggedDisplays = description;
@@ -2106,12 +2185,15 @@ sealed class Displays
             return;
         }
         lastRead = DateTime.UtcNow;
-        bool changed = false;
+        bool hdrBefore = builtInHdr;
+        builtInHdr = builtInScreen != null && SdrContentBrightness.HdrIsOn(builtInScreen);
+        bool changed = builtInHdr != hdrBefore;
         foreach (ExternalMonitor monitor in monitors)
         {
-            int before = monitor.Level;
+            int levelBefore = monitor.Level;
+            bool monitorHdrBefore = monitor.Hdr;
             monitor.Read();
-            changed |= monitor.Level != before;
+            changed |= monitor.Level != levelBefore || monitor.Hdr != monitorHdrBefore;
         }
         if (changed)
             RaiseChanged();
@@ -2191,7 +2273,8 @@ sealed class Displays
     }
 }
 
-// A monitor whose brightness is set over DDC/CI (VCP code 0x10, "luminance"). Used only on the
+// A monitor whose brightness is set over DDC/CI (VCP code 0x10, "luminance"), or, in HDR, as the
+// brightness of SDR content: monitors ignore their own brightness control in HDR. Used only on the
 // Displays worker thread, except for the properties and MarkRequested.
 sealed class ExternalMonitor : IDisposable
 {
@@ -2199,29 +2282,41 @@ sealed class ExternalMonitor : IDisposable
     const int Attempts = 3; // DDC/CI drops a command now and then, especially through docks and hubs
     static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(50);
 
-    readonly uint maximum;
+    readonly uint maximum; // of the DDC/CI value; 0 when the monitor does not answer DDC/CI
+    readonly DisplayDevice.Screen screen;
     IntPtr handle;
     uint lastWrittenValue = uint.MaxValue;
     int applied;      // what the monitor is at, as far as we know
     int requestCount;
     volatile int level; // where it is heading: shown in the tooltip
+    volatile bool hdr;
 
-    ExternalMonitor(IntPtr handle, string name, string edidVendor, ScreenArea area, uint current, uint maximum)
+    ExternalMonitor(IntPtr handle, string name, DisplayDevice.Screen screen, ScreenArea area,
+        bool hdr, int level, uint maximum)
     {
         this.handle = handle;
+        this.screen = screen;
+        this.hdr = hdr;
         this.maximum = maximum;
         Name = name;
-        EdidVendor = edidVendor;
         Area = area;
-        level = applied = ToPercent(current);
+        this.level = applied = level;
     }
 
     public string Name { get; private set; }
 
+    public bool Hdr
+    {
+        get { return hdr; }
+    }
+
     public ScreenArea Area { get; private set; }
 
     // Three-letter vendor code from the monitor's EDID (DEL, GSM ...), null when unknown
-    public string EdidVendor { get; private set; }
+    public string EdidVendor
+    {
+        get { return screen.EdidVendor; }
+    }
 
     public int Level
     {
@@ -2252,20 +2347,27 @@ sealed class ExternalMonitor : IDisposable
                 builtInArea = area;
             if (device != null && device.ExternalScreens.Count == 0)
                 continue;
-            int nameIndex = 0;
+            int screenIndex = 0;
             foreach (NativeMethods.PhysicalMonitor physical in PhysicalMonitors(displayMonitor))
             {
                 uint current, maximum;
-                if (!TryReadLuminance(physical.handle, out current, out maximum) || maximum == 0)
+                bool answersDdc = TryReadLuminance(physical.handle, out current, out maximum) && maximum > 0;
+                // With a duplicated image the built-in panel is one of the physical monitors and does not
+                // answer DDC/CI, so a silent monitor gets an external screen only without a built-in one.
+                DisplayDevice.Screen screen = device != null && screenIndex < device.ExternalScreens.Count
+                    && (answersDdc || !device.ShowsOnBuiltIn)
+                    ? device.ExternalScreens[screenIndex++]
+                    : new DisplayDevice.Screen();
+                int sdrLevel = 0;
+                bool hdr = SdrContentBrightness.HdrIsOn(screen) && SdrContentBrightness.TryRead(screen, out sdrLevel);
+                if (!hdr && !answersDdc)
                 {
                     NativeMethods.DestroyPhysicalMonitor(physical.handle);
                     continue;
                 }
-                DisplayDevice.Screen screen = device != null && nameIndex < device.ExternalScreens.Count
-                    ? device.ExternalScreens[nameIndex++]
-                    : new DisplayDevice.Screen();
+                int level = hdr ? sdrLevel : ToPercent(current, maximum);
                 string name = UniqueName(screen.Name ?? NameOf(physical), found);
-                found.Add(new ExternalMonitor(physical.handle, name, screen.EdidVendor, area, current, maximum));
+                found.Add(new ExternalMonitor(physical.handle, name, screen, area, hdr, level, answersDdc ? maximum : 0));
             }
         }
         return found;
@@ -2280,8 +2382,15 @@ sealed class ExternalMonitor : IDisposable
 
     public bool Write(int percent)
     {
+        if (hdr)
+        {
+            if (!SdrContentBrightness.Write(screen, percent))
+                return false;
+            applied = percent;
+            return true;
+        }
         uint value = (uint)Math.Round(percent * maximum / 100.0);
-        for (int attempt = 1; handle != IntPtr.Zero && attempt <= Attempts; attempt++)
+        for (int attempt = 1; handle != IntPtr.Zero && maximum > 0 && attempt <= Attempts; attempt++)
         {
             if (NativeMethods.SetVCPFeature(handle, LuminanceCode, value))
             {
@@ -2294,14 +2403,24 @@ sealed class ExternalMonitor : IDisposable
         return false;
     }
 
+    // Also notices HDR being switched on or off.
     public void Read()
     {
         int requestsBefore = Thread.VolatileRead(ref requestCount);
-        uint current, ignoredMaximum;
-        if (!TryReadLuminance(handle, out current, out ignoredMaximum))
-            return;
-        if (current != lastWrittenValue) // the same value would come back rounded differently
-            applied = ToPercent(current);
+        int sdrLevel = 0;
+        hdr = SdrContentBrightness.HdrIsOn(screen) && SdrContentBrightness.TryRead(screen, out sdrLevel);
+        if (hdr)
+        {
+            applied = sdrLevel;
+        }
+        else
+        {
+            uint current, ignoredMaximum;
+            if (maximum == 0 || !TryReadLuminance(handle, out current, out ignoredMaximum))
+                return;
+            if (current != lastWrittenValue) // the same value would come back rounded differently
+                applied = ToPercent(current, maximum);
+        }
         if (Thread.VolatileRead(ref requestCount) == requestsBefore)
             level = applied;
     }
@@ -2313,7 +2432,7 @@ sealed class ExternalMonitor : IDisposable
         handle = IntPtr.Zero;
     }
 
-    int ToPercent(uint value)
+    static int ToPercent(uint value, uint maximum)
     {
         return (int)Math.Round(Math.Min(value, maximum) * 100.0 / maximum);
     }
@@ -2393,6 +2512,54 @@ sealed class ScreenArea
     }
 }
 
+// In HDR Windows shows SDR content (the desktop and most apps) at an adjustable white level:
+// Settings > Display > HDR > SDR content brightness, from 80 to 480 nits. Reading it is documented;
+// setting it is not, but it is what that slider uses, and Windows keeps the value.
+static class SdrContentBrightness
+{
+    const uint WhiteLevelAt0 = 1000;       // 80 nits; 1000 is the unit of SDRWhiteLevel
+    const uint WhiteLevelPerPercent = 50;  // 4 nits, one step of the slider
+    const uint AdvancedColorEnabled = 0x2;
+    const uint WideColorEnforced = 0x4;    // color management on an SDR display, not HDR
+
+    public static bool HdrIsOn(DisplayDevice.Screen screen)
+    {
+        if (screen.TargetId == 0 && screen.AdapterId.LowPart == 0 && screen.AdapterId.HighPart == 0)
+            return false;
+        var request = new NativeMethods.DisplayConfigAdvancedColorInfo();
+        request.header = DisplayDevice.Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+            request, screen.AdapterId, screen.TargetId);
+        return NativeMethods.DisplayConfigGetDeviceInfo(ref request) == 0
+            && (request.value & AdvancedColorEnabled) != 0
+            && (request.value & WideColorEnforced) == 0;
+    }
+
+    public static bool TryRead(DisplayDevice.Screen screen, out int percent)
+    {
+        var request = new NativeMethods.DisplayConfigSdrWhiteLevel();
+        request.header = DisplayDevice.Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+            request, screen.AdapterId, screen.TargetId);
+        percent = 0;
+        if (NativeMethods.DisplayConfigGetDeviceInfo(ref request) != 0)
+            return false;
+        long steps = ((long)request.SDRWhiteLevel - WhiteLevelAt0) / WhiteLevelPerPercent;
+        percent = (int)Math.Max(0, Math.Min(100, steps));
+        return true;
+    }
+
+    public static bool Write(DisplayDevice.Screen screen, int percent)
+    {
+        var request = new NativeMethods.DisplayConfigSetSdrWhiteLevel
+        {
+            SDRWhiteLevel = WhiteLevelAt0 + (uint)Math.Max(0, Math.Min(100, percent)) * WhiteLevelPerPercent,
+            finalValue = 1
+        };
+        request.header = DisplayDevice.Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL,
+            request, screen.AdapterId, screen.TargetId);
+        return NativeMethods.DisplayConfigSetDeviceInfo(ref request) == 0;
+    }
+}
+
 // The screens Windows shows a display device (\\.\DISPLAY1 ...) on: one, or several when the
 // image is duplicated. External screens get their own model name, as in Settings > Display,
 // with the vendor in front when the model name leaves it out.
@@ -2402,6 +2569,8 @@ sealed class DisplayDevice
     {
         public string Name;
         public string EdidVendor;
+        public NativeMethods.Luid AdapterId;
+        public uint TargetId;
     }
 
     // EDID carries only a registered three-letter code; these are well-known monitor brands.
@@ -2415,6 +2584,7 @@ sealed class DisplayDevice
     };
 
     public bool ShowsOnBuiltIn;
+    public Screen BuiltInScreen;
     public readonly List<Screen> ExternalScreens = new List<Screen>();
 
     // Empty when Windows cannot tell
@@ -2444,12 +2614,13 @@ sealed class DisplayDevice
             if (IsBuiltInConnection(paths[i].targetInfo.outputTechnology))
             {
                 device.ShowsOnBuiltIn = true;
+                device.BuiltInScreen = TargetOf(paths[i]);
                 continue;
             }
             var target = new NativeMethods.DisplayConfigTargetDeviceName();
             target.header = Header(NativeMethods.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, target,
                 paths[i].targetInfo.adapterId, paths[i].targetInfo.id);
-            var screen = new Screen();
+            Screen screen = TargetOf(paths[i]);
             if (NativeMethods.DisplayConfigGetDeviceInfo(ref target) == 0)
             {
                 if ((target.flags & NativeMethods.DISPLAYCONFIG_TARGET_EDID_IDS_VALID) != 0)
@@ -2492,7 +2663,27 @@ sealed class DisplayDevice
         return vendor + " " + model;
     }
 
-    static NativeMethods.DisplayConfigDeviceInfoHeader Header(uint type, object request, NativeMethods.Luid adapter, uint id)
+    public static Screen BuiltInScreenOf(Dictionary<string, DisplayDevice> devices)
+    {
+        foreach (DisplayDevice device in devices.Values)
+            if (device.BuiltInScreen != null)
+                return device.BuiltInScreen;
+        return null;
+    }
+
+    public static bool BuiltInHdrIsOn()
+    {
+        Screen builtIn = BuiltInScreenOf(Active());
+        return builtIn != null && SdrContentBrightness.HdrIsOn(builtIn);
+    }
+
+    static Screen TargetOf(NativeMethods.DisplayConfigPathInfo path)
+    {
+        return new Screen { AdapterId = path.targetInfo.adapterId, TargetId = path.targetInfo.id };
+    }
+
+    public static NativeMethods.DisplayConfigDeviceInfoHeader Header(
+        uint type, object request, NativeMethods.Luid adapter, uint id)
     {
         return new NativeMethods.DisplayConfigDeviceInfoHeader
         {
@@ -2847,6 +3038,7 @@ static class SettingsStore
     const string TrayIconVisibleValue = "TrayVisible";
     const string SmoothBrightnessChangesValue = "SmoothBrightnessChanges";
     const string ScrollScopeValue = "ScrollScope";
+    const string BrightnessOutsideHdrValue = "BrightnessOutsideHdr";
     const string ScrollHintSeenValue = "ScrollHintSeen";
 
     public static AppSettings Load()
@@ -2891,6 +3083,29 @@ static class SettingsStore
     {
         using (RegistryKey key = OpenKey())
             WriteFlag(key, ScrollHintSeenValue, true);
+    }
+
+    // Built-in display brightness to return to when HDR turns off; kept across restarts
+    public static int? BrightnessOutsideHdr
+    {
+        get
+        {
+            using (RegistryKey key = OpenKey())
+            {
+                object value = key.GetValue(BrightnessOutsideHdrValue);
+                return value == null ? (int?)null : Convert.ToInt32(value);
+            }
+        }
+        set
+        {
+            using (RegistryKey key = OpenKey())
+            {
+                if (value.HasValue)
+                    key.SetValue(BrightnessOutsideHdrValue, value.Value, RegistryValueKind.DWord);
+                else
+                    key.DeleteValue(BrightnessOutsideHdrValue, false);
+            }
+        }
     }
 
     static RegistryKey OpenKey()
@@ -3178,6 +3393,9 @@ static class NativeMethods
     public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
     public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
     public const uint DISPLAYCONFIG_TARGET_EDID_IDS_VALID = 4;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO = 9;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL = 11;
+    public const uint DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL = 0xFFFFFFEE; // undocumented
     public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS = 6;
     public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED = 11;
     public const uint DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED = 13;
@@ -3283,6 +3501,30 @@ static class NativeMethods
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigAdvancedColorInfo
+    {
+        public DisplayConfigDeviceInfoHeader header;
+        public uint value;
+        public uint colorEncoding;
+        public uint bitsPerColorChannel;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigSdrWhiteLevel
+    {
+        public DisplayConfigDeviceInfoHeader header;
+        public uint SDRWhiteLevel;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DisplayConfigSetSdrWhiteLevel
+    {
+        public DisplayConfigDeviceInfoHeader header;
+        public uint SDRWhiteLevel;
+        public byte finalValue;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
 
@@ -3301,6 +3543,15 @@ static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigTargetDeviceName request);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigAdvancedColorInfo request);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref DisplayConfigSdrWhiteLevel request);
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigSetDeviceInfo(ref DisplayConfigSetSdrWhiteLevel request);
 
     [DllImport("dxva2.dll", SetLastError = true)]
     public static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr monitor, out uint count);
