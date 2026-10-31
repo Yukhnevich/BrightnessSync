@@ -2137,7 +2137,7 @@ sealed class Displays
                 + (monitor.Hdr ? " (HDR)" : ""));
         string description = string.Join(", ", names);
         if (monitors.Length == 0)
-            description += " (no external monitor with DDC/CI brightness or HDR)";
+            description += "; no external monitor with DDC/CI brightness or HDR";
         if (description != loggedDisplays)
             Log.Write("Displays: " + description);
         loggedDisplays = description;
