@@ -24,6 +24,7 @@ Brightness Sync listens for brightness changes and writes the current level into
 - Restores your level if a vendor tool overwrites a plan's brightness
 - Scroll over the tray icon to change the brightness, smoothly or instantly
 - External monitors (DDC/CI): one scroll changes all displays and keeps the difference between them
+- HDR aware: keeps your usual laptop brightness apart from HDR's, and adjusts SDR content brightness on HDR monitors
 - Windows 11 style tray icon that shows the brightness level and follows the light or dark taskbar
 - Tray menu and About window that follow the Windows theme
 - Run at startup without UAC prompts (via Task Scheduler)
@@ -95,6 +96,12 @@ Changing one kind of display on its own sets the new difference. Changes made el
 
 When the built-in display is off (lid closed, or *Second screen only* in **Win+P**), scrolling changes only the external monitors.
 
+### HDR
+
+- **Built-in display.** When HDR turns on, Windows raises the laptop panel to 80%: its backlight lights HDR content too. Brightness Sync keeps that level instead of taking it for your choice, and brings your usual brightness back when HDR turns off (Windows itself leaves it at 80%). Scrolling and power plan sync work in HDR as usual.
+- **External monitors.** In HDR, monitors ignore their own brightness control, so scrolling changes *SDR content brightness* instead, the same setting as *Settings > Display > HDR*: the desktop and apps get brighter or darker, while HDR videos and games keep their full brightness.
+- The tooltip marks every display with HDR on: `KTC M27P6 (HDR): 40%`.
+
 ### Tray menu
 
 | Laptop | Laptop + external monitor |
@@ -159,7 +166,7 @@ Brightness values already written to your power plans stay equal; this is harmle
 
 | What | Where |
 |---|---|
-| Settings | `HKCU\Software\BrightnessSync` (`SyncEnabled`, `TrayVisible`, `SmoothBrightnessChanges`, `ScrollScope`, `ScrollHintSeen`) |
+| Settings | `HKCU\Software\BrightnessSync` (`SyncEnabled`, `TrayVisible`, `SmoothBrightnessChanges`, `ScrollScope`, `ScrollHintSeen`, `BrightnessOutsideHdr`) |
 | Log | `%LOCALAPPDATA%\BrightnessSync.log`, rotated to `.log.1` at 64 KB. **About → Open** opens it |
 | Startup | Task Scheduler → `BrightnessSync` |
 
